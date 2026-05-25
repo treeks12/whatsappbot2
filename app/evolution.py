@@ -126,7 +126,7 @@ class EvolutionClient:
         caption: str = "",
     ):
         async with self.media_semaphore:
-            media = await file_to_data_uri(media_path, mime_type)
+            media = await file_to_base64(media_path)
             payload = {
                 "number": normalize_phone(phone),
                 "mediatype": "image",
@@ -147,19 +147,28 @@ class EvolutionClient:
 
 def normalize_phone(phone: str) -> str:
     digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    if digits.startswith("0") and len(digits) in (11, 12):
+        digits = digits[1:]
+    elif digits.startswith("0") and len(digits) in (13, 14):
+        digits = digits[3:]
     if len(digits) in (10, 11):
         return f"55{digits}"
+    if digits.startswith("550") and len(digits) in (13, 14):
+        return "55" + digits[3:]
     return digits
 
 
-async def file_to_data_uri(path: str, mime_type: str) -> str:
+async def file_to_base64(path: str) -> str:
     async with aiofiles.open(path, "rb") as f:
         raw = await f.read()
     encoded = base64.b64encode(raw).decode("ascii")
     del raw
-    result = f"data:{mime_type};base64,{encoded}"
-    del encoded
-    return result
+    return encoded
+
+
+async def file_to_data_uri(path: str, mime_type: str) -> str:
+    encoded = await file_to_base64(path)
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def _extract_qr(payload: Dict[str, Any]) -> str:
