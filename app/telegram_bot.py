@@ -3,7 +3,7 @@ import io
 import logging
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -24,6 +24,7 @@ from .scheduler import CampaignScheduler
 logger = logging.getLogger(__name__)
 
 WAITING_CSV, WAITING_MEDIA, WAITING_CAPTION = range(3)
+PERM_STATE_KEY = "perm_state"
 
 
 def register_handlers(application):
@@ -58,6 +59,7 @@ def register_handlers(application):
         )
     )
     application.add_handler(CommandHandler("cancelar", cancelar))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, perm_receive_name))
 
 
 def services(context: ContextTypes.DEFAULT_TYPE) -> tuple[Settings, Database, EvolutionClient, CampaignScheduler]:
@@ -74,28 +76,46 @@ def is_authorized(settings: Settings, user_id: int) -> bool:
 
 
 async def require_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    settings, _, _, _ = services(context)
+    settings, db, _, _ = services(context)
     user_id = update.effective_user.id
     if is_authorized(settings, user_id):
         return True
-
-    await update.effective_message.reply_text(f"Acesso negado. Seu ID: {user_id}")
+    if await db.is_user_approved(user_id):
+        return True
+    await update.effective_message.reply_text("Acesso negado. Use /start para pedir permissão.")
     return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_user(update, context):
+    settings, db, _, _ = services(context)
+    user_id = update.effective_user.id
+
+    if is_authorized(settings, user_id) or await db.is_user_approved(user_id):
+        await update.message.reply_text(
+            "Bot v2 ativo.\n\n"
+            "/login - conectar WhatsApp\n"
+            "/nova - criar campanha com precaucao\n"
+            "/nova_confianca - campanha para contatos de confianca\n"
+            "/nova_precaucao - campanha mais cuidadosa\n"
+            "/disparar - iniciar campanha pronta\n"
+            "/status - ver ultimas campanhas\n"
+            "/cancelar - cancelar campanha ativa"
+        )
+        return
+
+    pending = await db.get_pending_request(user_id)
+    if pending:
+        await update.message.reply_text("Permissão já requisitada. Aguarde a aprovação.")
         return
 
     await update.message.reply_text(
-        "Bot v2 ativo.\n\n"
-        "/login - conectar WhatsApp\n"
-        "/nova - criar campanha com precaucao\n"
-        "/nova_confianca - campanha para contatos de confianca\n"
-        "/nova_precaucao - campanha mais cuidadosa\n"
-        "/disparar - iniciar campanha pronta\n"
-        "/status - ver ultimas campanhas\n"
-        "/cancelar - cancelar campanha ativa"
+        "Usuário desconhecido.\n\nDeseja pedir permissão?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Sim", callback_data="perm_yes"),
+                InlineKeyboardButton("Não", callback_data="perm_no"),
+            ]
+        ]),
     )
 
 
@@ -432,7 +452,86 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
+    query = update.callback_query
+    data = query.data
+
+    if data == "perm_yes":
+        await query.answer()
+        context.user_data[PERM_STATE_KEY] = "waiting_name"
+        await query.edit_message_text("Escreva o seu nome:")
+        return
+
+    if data == "perm_no":
+        await query.answer()
+        await query.edit_message_text("Operação cancelada.")
+        context.user_data.pop(PERM_STATE_KEY, None)
+        return
+
+    if data.startswith("approve_"):
+        await query.answer()
+        target_id = int(data.split("_", 1)[1])
+        settings, db, _, _ = services(context)
+        request = await db.get_pending_request(target_id)
+        if not request:
+            await query.edit_message_text("Solicitação não encontrada ou já processada.")
+            return
+        await db.approve_user(target_id, query.from_user.id)
+        await query.edit_message_text(f"{request['name']} (ID {target_id}) aprovado.")
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="Sua permissão foi aprovada! Use /start para começar.",
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("reject_"):
+        await query.answer()
+        target_id = int(data.split("_", 1)[1])
+        settings, db, _, _ = services(context)
+        request = await db.get_pending_request(target_id)
+        if not request:
+            await query.edit_message_text("Solicitação não encontrada ou já processada.")
+            return
+        await db.reject_user(target_id)
+        await query.edit_message_text(f"ID {target_id} recusado.")
+        return
+
+    await query.answer()
+
+
+async def perm_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get(PERM_STATE_KEY) != "waiting_name":
+        return
+
+    name = update.message.text.strip()[:100]
+    if not name:
+        await update.message.reply_text("Nome inválido. Tente novamente:")
+        return
+
+    user = update.effective_user
+    settings, db, _, _ = services(context)
+
+    context.user_data.pop(PERM_STATE_KEY, None)
+    await db.request_access(user.id, user.username or "", name)
+
+    for admin_id in settings.telegram_admin_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"ID {user.id} - {name} pediu permissão, aceitar?",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Aceitar", callback_data=f"approve_{user.id}"),
+                        InlineKeyboardButton("Recusar", callback_data=f"reject_{user.id}"),
+                    ]
+                ]),
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text("Permissão requisitada. Aguarde a aprovação.")
 
 
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:

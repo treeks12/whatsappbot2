@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS sent_messages (
     UNIQUE(campaign_id, phone),
     FOREIGN KEY(campaign_id) REFERENCES campaigns(id),
     FOREIGN KEY(contact_id) REFERENCES contacts(id)
+    );
+
+CREATE TABLE IF NOT EXISTS authorized_users (
+    telegram_id INTEGER PRIMARY KEY,
+    username TEXT,
+    name TEXT NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0,
+    approved_by INTEGER,
+    requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    approved_at TEXT
 );
 """
 
@@ -180,8 +190,49 @@ class Database:
                         UPDATE campaigns
                         SET status = 'failed', finished_at = CURRENT_TIMESTAMP
                         WHERE status IN ('running', 'paused')
-                        """
-                    )
+             """
+         )
+
+    async def request_access(self, telegram_id: int, username: str, name: str):
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO authorized_users (telegram_id, username, name, approved) VALUES (?, ?, ?, 0)",
+                    (telegram_id, username, name),
+                )
+
+    async def is_user_approved(self, telegram_id: int) -> bool:
+        async with self._lock:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT approved FROM authorized_users WHERE telegram_id = ?",
+                    (telegram_id,),
+                ).fetchone()
+                return row is not None and row["approved"] == 1
+
+    async def get_pending_request(self, telegram_id: int):
+        async with self._lock:
+            with self.connect() as conn:
+                return conn.execute(
+                    "SELECT * FROM authorized_users WHERE telegram_id = ? AND approved = 0",
+                    (telegram_id,),
+                ).fetchone()
+
+    async def approve_user(self, telegram_id: int, admin_id: int):
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    "UPDATE authorized_users SET approved = 1, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE telegram_id = ?",
+                    (admin_id, telegram_id),
+                )
+
+    async def reject_user(self, telegram_id: int):
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    "DELETE FROM authorized_users WHERE telegram_id = ? AND approved = 0",
+                    (telegram_id,),
+                )
                 return ids
 
     async def set_caption(self, campaign_id: int, caption: str):
