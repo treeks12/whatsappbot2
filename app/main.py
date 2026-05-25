@@ -25,8 +25,12 @@ async def post_init(application: Application):
     db = application.bot_data["db"]
     evolution = application.bot_data["evolution"]
     settings.campaigns_dir.mkdir(parents=True, exist_ok=True)
-    await db.setup()
-    interrupted_ids = await db.recover_interrupted_campaigns()
+    try:
+        await db.setup()
+    except Exception as exc:
+        logger.exception("DB setup failed")
+        raise
+    interrupted_ids = await db.recover_interrupted_campaigns() or []
     for campaign_id in interrupted_ids:
         await cleanup_campaign_payload(
             db,
