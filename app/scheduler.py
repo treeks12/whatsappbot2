@@ -15,6 +15,17 @@ from .profiles import get_profile
 logger = logging.getLogger(__name__)
 
 
+def available_memory_mb() -> float:
+    try:
+        info = Path("/proc/meminfo").read_text()
+        for line in info.splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 9999
+
+
 class CampaignScheduler:
     def __init__(
         self,
@@ -25,6 +36,7 @@ class CampaignScheduler:
         progress_update_interval_seconds: int = 5,
         campaigns_dir: Optional[Path] = None,
         cleanup_campaign_files_on_finish: bool = True,
+        min_free_memory_mb: int = 256,
     ):
         self.db = db
         self.evolution = evolution
@@ -33,6 +45,7 @@ class CampaignScheduler:
         self.progress_update_interval_seconds = max(2, progress_update_interval_seconds)
         self.campaigns_dir = campaigns_dir
         self.cleanup_campaign_files_on_finish = cleanup_campaign_files_on_finish
+        self.min_free_memory_mb = min_free_memory_mb
         self.tasks: Dict[int, asyncio.Task] = {}
         self.instance_locks: Dict[str, asyncio.Lock] = {}
 
@@ -158,11 +171,13 @@ class CampaignScheduler:
                 await progress.update(f"Campanha #{campaign_id} falhou.")
 
     async def _send_contact(self, campaign, contact, profile):
+        await self._wait_for_memory()
         media_items = await self.db.get_media(campaign["id"])
         text = (campaign["caption"] or "").replace("{nome}", contact["name"] or "Cliente")
 
         for index, media in enumerate(media_items):
             is_last_media = index == len(media_items) - 1
+            await self._wait_for_memory()
             await self.evolution.send_media(
                 campaign["instance_name"],
                 contact["phone"],
@@ -184,6 +199,15 @@ class CampaignScheduler:
 
         while not is_inside_window(self.send_window):
             await asyncio.sleep(60)
+
+    async def _wait_for_memory(self):
+        threshold = self.min_free_memory_mb
+        free = available_memory_mb()
+        if free >= threshold:
+            return
+        logger.warning("RAM livre %.0fMB abaixo do limite %dMB, aguardando...", free, threshold)
+        while available_memory_mb() < threshold:
+            await asyncio.sleep(30)
 
     async def _cleanup_campaign_payload(self, campaign_id: int):
         if not self.campaigns_dir:

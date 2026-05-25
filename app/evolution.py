@@ -3,6 +3,7 @@ import base64
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import aiofiles
 import aiohttp
 
 
@@ -119,18 +120,22 @@ class EvolutionClient:
     ):
         async with self.media_semaphore:
             media = await file_to_data_uri(media_path, mime_type)
-            return await self._request(
+            payload = {
+                "number": normalize_phone(phone),
+                "mediatype": "image",
+                "mimetype": mime_type,
+                "caption": caption,
+                "media": media,
+                "fileName": file_name,
+            }
+            del media
+            result = await self._request(
                 "POST",
                 f"/message/sendMedia/{instance_name}",
-                json={
-                    "number": normalize_phone(phone),
-                    "mediatype": "image",
-                    "mimetype": mime_type,
-                    "caption": caption,
-                    "media": media,
-                    "fileName": file_name,
-                },
+                json=payload,
             )
+            del payload
+            return result
 
 
 def normalize_phone(phone: str) -> str:
@@ -141,9 +146,13 @@ def normalize_phone(phone: str) -> str:
 
 
 async def file_to_data_uri(path: str, mime_type: str) -> str:
-    data = Path(path).read_bytes()
-    encoded = base64.b64encode(data).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+    async with aiofiles.open(path, "rb") as f:
+        raw = await f.read()
+    encoded = base64.b64encode(raw).decode("ascii")
+    del raw
+    result = f"data:{mime_type};base64,{encoded}"
+    del encoded
+    return result
 
 
 def _extract_qr(payload: Dict[str, Any]) -> str:

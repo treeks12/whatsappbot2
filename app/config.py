@@ -46,6 +46,7 @@ class Settings:
     cleanup_campaign_files_on_finish: bool
     default_profile: str
     send_window: Optional[str]
+    min_free_memory_mb: int
 
 
 def load_settings() -> Settings:
@@ -66,4 +67,5 @@ def load_settings() -> Settings:
         cleanup_campaign_files_on_finish=_bool_env("CLEANUP_CAMPAIGN_FILES_ON_FINISH", True),
         default_profile=os.getenv("DEFAULT_PROFILE", "humano_100"),
         send_window=os.getenv("SEND_WINDOW") or None,
+        min_free_memory_mb=_int_env("MIN_FREE_MEMORY_MB", 256),
     )

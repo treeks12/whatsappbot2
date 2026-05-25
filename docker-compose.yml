@@ -22,6 +22,7 @@ services:
       - CLEANUP_CAMPAIGN_FILES_ON_FINISH=${CLEANUP_CAMPAIGN_FILES_ON_FINISH:-true}
       - DEFAULT_PROFILE=${DEFAULT_PROFILE:-precaucao_100}
       - SEND_WINDOW=${SEND_WINDOW:-}
+      - MIN_FREE_MEMORY_MB=${MIN_FREE_MEMORY_MB:-256}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data

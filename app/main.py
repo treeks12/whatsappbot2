@@ -85,6 +85,7 @@ def main():
         settings.progress_update_interval_seconds,
         settings.campaigns_dir,
         settings.cleanup_campaign_files_on_finish,
+        settings.min_free_memory_mb,
     )
 
     application.bot_data["settings"] = settings
