@@ -6,7 +6,7 @@ services:
     environment:
       - POSTGRES_DB=evolution
       - POSTGRES_USER=evolution
-      - POSTGRES_PASSWORD=evolution_secret
+      - POSTGRES_PASSWORD=evolution_local
     volumes:
       - evolution_db:/var/lib/postgresql/data
     networks:
@@ -15,25 +15,63 @@ services:
   evolution-api:
     image: evoapicloud/evolution-api:2.4.0-rc2
     container_name: evolution-api
+    ports:
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
     depends_on:
       - evolution-db
+      - evolution-redis
     environment:
+      - SERVER_TYPE=http
       - SERVER_PORT=8080
+      - SERVER_URL=http://localhost:8080
+      - CORS_ORIGIN=*
+      - CORS_METHODS=POST,GET,PUT,DELETE
+      - CORS_CREDENTIALS=true
       - AUTHENTICATION_TYPE=apikey
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - GLOBAL_API_KEY=${EVOLUTION_API_KEY}
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
       - LANGUAGE=pt-BR
       - STORE_MESSAGES=false
       - STORE_CONTACTS=false
       - STORE_CHATS=false
-      - LOG_LEVEL=WARN
+      - CONFIG_SESSION_PHONE_CLIENT=Evolution API VPS
+      - CONFIG_SESSION_PHONE_NAME=Chrome
+      - QRCODE_LIMIT=30
+      - LOG_LEVEL=INFO
+      - LOG_COLOR=true
+      - LOG_BAILEYS=info
+      - STORAGE_PROVIDER=local
+      - STORAGE_LOCAL_PATH=/evolution/store
       - DATABASE_ENABLED=true
       - DATABASE_PROVIDER=postgresql
-      - DATABASE_CONNECTION_URI=postgresql://evolution:evolution_secret@evolution-db:5432/evolution
+      - DATABASE_CONNECTION_URI=postgresql://evolution:evolution_local@evolution-db:5432/evolution
       - DATABASE_CONNECTION_DATABASE_NAME=evolution
-      - REDIS_ENABLED=false
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_v24
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=false
+      - DATABASE_SAVE_MESSAGE_UPDATE=false
+      - DATABASE_SAVE_DATA_CONTACTS=false
+      - DATABASE_SAVE_DATA_CHATS=false
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://evolution-redis:6379/1
+      - CACHE_REDIS_PREFIX_KEY=evolution24
+      - CACHE_REDIS_SAVE_INSTANCES=false
+      - CACHE_LOCAL_ENABLED=false
     volumes:
+      - evolution_store:/evolution/store
       - evolution_instances:/evolution/instances
+    networks:
+      - bot-net
+
+  evolution-redis:
+    image: redis:7-alpine
+    container_name: evolution-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - evolution_redis:/data
     networks:
       - bot-net
 
@@ -71,8 +109,10 @@ services:
       - bot-net
 
 volumes:
+  evolution_store:
   evolution_instances:
   evolution_db:
+  evolution_redis:
 
 networks:
   bot-net:
