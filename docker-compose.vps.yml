@@ -1,8 +1,23 @@
 services:
+  evolution-db:
+    image: postgres:16-alpine
+    container_name: evolution-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=evolution
+      - POSTGRES_USER=evolution
+      - POSTGRES_PASSWORD=evolution_secret
+    volumes:
+      - evolution_db:/var/lib/postgresql/data
+    networks:
+      - bot-net
+
   evolution-api:
-    image: evoapicloud/evolution-api:v2.4.0
+    image: evoapicloud/evolution-api:2.4.0-rc2
     container_name: evolution-api
     restart: unless-stopped
+    depends_on:
+      - evolution-db
     environment:
       - SERVER_PORT=8080
       - AUTHENTICATION_TYPE=apikey
@@ -12,7 +27,10 @@ services:
       - STORE_CONTACTS=false
       - STORE_CHATS=false
       - LOG_LEVEL=WARN
-      - DATABASE_ENABLED=false
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://evolution:evolution_secret@evolution-db:5432/evolution
+      - DATABASE_CONNECTION_DATABASE_NAME=evolution
       - REDIS_ENABLED=false
     volumes:
       - evolution_instances:/evolution/instances
@@ -54,6 +72,7 @@ services:
 
 volumes:
   evolution_instances:
+  evolution_db:
 
 networks:
   bot-net:
