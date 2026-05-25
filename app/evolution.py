@@ -89,6 +89,13 @@ class EvolutionClient:
             message = str(exc).lower()
             if "already in use" not in message and "already exists" not in message:
                 raise
+            try:
+                connect_payload = await self.connect_instance(instance_name)
+                qr = _extract_qr(connect_payload)
+                if qr:
+                    return qr
+            except EvolutionError:
+                pass
             await self.delete_instance(instance_name)
             create_payload = await self.create_instance(instance_name)
 
