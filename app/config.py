@@ -16,6 +16,13 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "sim", "on")
+
+
 def _admin_ids() -> Set[int]:
     raw = os.getenv("TELEGRAM_ADMIN_IDS", "")
     return {int(item.strip()) for item in raw.split(",") if item.strip()}
@@ -36,6 +43,7 @@ class Settings:
     max_media_file_mb: int
     max_parallel_media_uploads: int
     progress_update_interval_seconds: int
+    cleanup_campaign_files_on_finish: bool
     default_profile: str
     send_window: Optional[str]
 
@@ -55,6 +63,7 @@ def load_settings() -> Settings:
         max_media_file_mb=_int_env("MAX_MEDIA_FILE_MB", 3),
         max_parallel_media_uploads=_int_env("MAX_PARALLEL_MEDIA_UPLOADS", 2),
         progress_update_interval_seconds=_int_env("PROGRESS_UPDATE_INTERVAL_SECONDS", 5),
+        cleanup_campaign_files_on_finish=_bool_env("CLEANUP_CAMPAIGN_FILES_ON_FINISH", True),
         default_profile=os.getenv("DEFAULT_PROFILE", "humano_100"),
         send_window=os.getenv("SEND_WINDOW") or None,
     )

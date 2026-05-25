@@ -62,6 +62,7 @@ MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN=100
 MAX_MEDIA_FILE_MB=3
 MAX_PARALLEL_MEDIA_UPLOADS=2
 PROGRESS_UPDATE_INTERVAL_SECONDS=5
+CLEANUP_CAMPAIGN_FILES_ON_FINISH=true
 DEFAULT_PROFILE=precaucao_100
 SEND_WINDOW=
 ```
@@ -176,6 +177,10 @@ Evite fazer deploy/build pesado do ecommerce ao mesmo tempo que uma campanha gra
 - Midias de campanha: `campaigns/`
 
 Essas pastas ficam fora do Git por padrao.
+
+Quando `CLEANUP_CAMPAIGN_FILES_ON_FINISH=true`, arquivos de campanha sao removidos depois que a campanha conclui, falha ou e cancelada. O historico util continua no SQLite, incluindo telefones enviados para identificar clientes conhecidos em campanhas futuras.
+
+Se o bot reiniciar no meio de uma campanha, campanhas que estavam `running` ou `paused` sao marcadas como `failed` no proximo boot para nao ficarem bloqueando a vendedora para sempre.
 
 ## Observacoes
 

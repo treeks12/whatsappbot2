@@ -1,10 +1,12 @@
 import asyncio
 import logging
 from datetime import datetime, time
+from pathlib import Path
 from typing import Dict, Optional
 
 from telegram.ext import Application
 
+from .cleanup import cleanup_campaign_payload
 from .db import Database
 from .evolution import EvolutionClient
 from .profiles import get_profile
@@ -21,12 +23,16 @@ class CampaignScheduler:
         telegram_app: Application,
         send_window: Optional[str],
         progress_update_interval_seconds: int = 5,
+        campaigns_dir: Optional[Path] = None,
+        cleanup_campaign_files_on_finish: bool = True,
     ):
         self.db = db
         self.evolution = evolution
         self.telegram_app = telegram_app
         self.send_window = parse_window(send_window)
         self.progress_update_interval_seconds = max(2, progress_update_interval_seconds)
+        self.campaigns_dir = campaigns_dir
+        self.cleanup_campaign_files_on_finish = cleanup_campaign_files_on_finish
         self.tasks: Dict[int, asyncio.Task] = {}
         self.instance_locks: Dict[str, asyncio.Lock] = {}
 
@@ -52,6 +58,7 @@ class CampaignScheduler:
             task.cancel()
 
         await self.db.finish_campaign(campaign["id"], "cancelled")
+        await self._cleanup_campaign_payload(campaign["id"])
         return True
 
     async def _run_campaign(self, campaign_id: int, progress_chat_id: Optional[int], progress_message_id: Optional[int]):
@@ -79,6 +86,7 @@ class CampaignScheduler:
                     contact = await self.db.next_pending_contact(campaign_id)
                     if not contact:
                         await self.db.finish_campaign(campaign_id, "completed")
+                        await self._cleanup_campaign_payload(campaign_id)
                         counts = await self.db.campaign_progress(campaign_id)
                         await progress.update(
                             f"Campanha #{campaign_id} concluida.\n"
@@ -140,11 +148,13 @@ class CampaignScheduler:
                             )
             except asyncio.CancelledError:
                 await self.db.finish_campaign(campaign_id, "cancelled")
+                await self._cleanup_campaign_payload(campaign_id)
                 await progress.update(f"Campanha #{campaign_id} cancelada.")
                 raise
             except Exception:
                 logger.exception("Erro fatal na campanha %s", campaign_id)
                 await self.db.finish_campaign(campaign_id, "failed")
+                await self._cleanup_campaign_payload(campaign_id)
                 await progress.update(f"Campanha #{campaign_id} falhou.")
 
     async def _send_contact(self, campaign, contact, profile):
@@ -174,6 +184,16 @@ class CampaignScheduler:
 
         while not is_inside_window(self.send_window):
             await asyncio.sleep(60)
+
+    async def _cleanup_campaign_payload(self, campaign_id: int):
+        if not self.campaigns_dir:
+            return
+        await cleanup_campaign_payload(
+            self.db,
+            self.campaigns_dir,
+            campaign_id,
+            self.cleanup_campaign_files_on_finish,
+        )
 
     async def _sleep_with_progress(self, delay: float, progress, body: str, countdown_label: str):
         remaining = max(0, int(delay))

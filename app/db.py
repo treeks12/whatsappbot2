@@ -74,6 +74,7 @@ class Database:
     def connect(self):
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
@@ -84,6 +85,8 @@ class Database:
         async with self._lock:
             with self.connect() as conn:
                 conn.executescript(SCHEMA)
+                self._cleanup_orphan_records(conn)
+                self._refresh_campaign_counters(conn)
 
     async def ensure_vendor(self, telegram_id: int, username: str, instance_name: str):
         async with self._lock:
@@ -164,6 +167,23 @@ class Database:
                     (status, campaign_id),
                 )
 
+    async def recover_interrupted_campaigns(self) -> list[int]:
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM campaigns WHERE status IN ('running', 'paused')"
+                ).fetchall()
+                ids = [int(row["id"]) for row in rows]
+                if ids:
+                    conn.execute(
+                        """
+                        UPDATE campaigns
+                        SET status = 'failed', finished_at = CURRENT_TIMESTAMP
+                        WHERE status IN ('running', 'paused')
+                        """
+                    )
+                return ids
+
     async def set_caption(self, campaign_id: int, caption: str):
         async with self._lock:
             with self.connect() as conn:
@@ -188,6 +208,25 @@ class Database:
                     "INSERT INTO media (campaign_id, path, mime_type, file_name) VALUES (?, ?, ?, ?)",
                     (campaign_id, path, mime_type, file_name),
                 )
+
+    async def delete_media_for_campaign(self, campaign_id: int):
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM media WHERE campaign_id = ?", (campaign_id,))
+
+    async def existing_campaign_ids(self) -> set[int]:
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute("SELECT id FROM campaigns").fetchall()
+                return {int(row["id"]) for row in rows}
+
+    async def terminal_campaign_ids(self) -> list[int]:
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM campaigns WHERE status IN ('completed', 'cancelled', 'failed')"
+                ).fetchall()
+                return [int(row["id"]) for row in rows]
 
     async def count_media(self, campaign_id: int) -> int:
         async with self._lock:
@@ -292,3 +331,33 @@ class Database:
                     """,
                     (vendor_id,),
                 ).fetchall()
+
+    def _cleanup_orphan_records(self, conn: sqlite3.Connection):
+        conn.execute(
+            """
+            DELETE FROM sent_messages
+            WHERE campaign_id NOT IN (SELECT id FROM campaigns)
+               OR contact_id NOT IN (SELECT id FROM contacts)
+            """
+        )
+        conn.execute("DELETE FROM media WHERE campaign_id NOT IN (SELECT id FROM campaigns)")
+        conn.execute("DELETE FROM contacts WHERE campaign_id NOT IN (SELECT id FROM campaigns)")
+
+    def _refresh_campaign_counters(self, conn: sqlite3.Connection):
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET
+                total_contacts = (
+                    SELECT COUNT(*) FROM contacts WHERE contacts.campaign_id = campaigns.id
+                ),
+                sent_count = (
+                    SELECT COUNT(*) FROM contacts
+                    WHERE contacts.campaign_id = campaigns.id AND contacts.status = 'sent'
+                ),
+                current_index = (
+                    SELECT COUNT(*) FROM contacts
+                    WHERE contacts.campaign_id = campaigns.id AND contacts.status IN ('sent', 'failed')
+                )
+            """
+        )

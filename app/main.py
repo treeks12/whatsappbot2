@@ -3,6 +3,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application
 
+from .cleanup import cleanup_campaign_payload, cleanup_orphan_campaign_dirs
 from .config import load_settings
 from .db import Database
 from .evolution import EvolutionClient
@@ -23,9 +24,29 @@ async def post_init(application: Application):
     settings = application.bot_data["settings"]
     db = application.bot_data["db"]
     evolution = application.bot_data["evolution"]
-    await db.setup()
-    await evolution.start()
     settings.campaigns_dir.mkdir(parents=True, exist_ok=True)
+    await db.setup()
+    interrupted_ids = await db.recover_interrupted_campaigns()
+    for campaign_id in interrupted_ids:
+        await cleanup_campaign_payload(
+            db,
+            settings.campaigns_dir,
+            campaign_id,
+            settings.cleanup_campaign_files_on_finish,
+        )
+    for campaign_id in await db.terminal_campaign_ids():
+        await cleanup_campaign_payload(
+            db,
+            settings.campaigns_dir,
+            campaign_id,
+            settings.cleanup_campaign_files_on_finish,
+        )
+    await cleanup_orphan_campaign_dirs(
+        db,
+        settings.campaigns_dir,
+        settings.cleanup_campaign_files_on_finish,
+    )
+    await evolution.start()
     logger.info("Bot v2 inicializado")
 
 
@@ -62,6 +83,8 @@ def main():
         application,
         settings.send_window,
         settings.progress_update_interval_seconds,
+        settings.campaigns_dir,
+        settings.cleanup_campaign_files_on_finish,
     )
 
     application.bot_data["settings"] = settings
