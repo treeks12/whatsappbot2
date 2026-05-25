@@ -1,0 +1,60 @@
+services:
+  evolution-api:
+    image: evoapicloud/evolution-api:v2.4.0
+    container_name: evolution-api
+    restart: unless-stopped
+    environment:
+      - SERVER_PORT=8080
+      - AUTHENTICATION_TYPE=apikey
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - LANGUAGE=pt-BR
+      - STORE_MESSAGES=false
+      - STORE_CONTACTS=false
+      - STORE_CHATS=false
+      - LOG_LEVEL=WARN
+      - DATABASE_ENABLED=false
+      - REDIS_ENABLED=false
+    volumes:
+      - evolution_instances:/evolution/instances
+    networks:
+      - bot-net
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-bot-v2
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS:-}
+      - EVOLUTION_API_URL=http://evolution-api:8080
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+      - DATABASE_PATH=/app/data/bot.sqlite3
+      - CAMPAIGNS_DIR=/app/campaigns
+      - MAX_CLIENTS_PER_CAMPAIGN=${MAX_CLIENTS_PER_CAMPAIGN:-100}
+      - MAX_TRUSTED_CLIENTS_PER_CAMPAIGN=${MAX_TRUSTED_CLIENTS_PER_CAMPAIGN:-300}
+      - MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN=${MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN:-100}
+      - MAX_MEDIA_PER_CAMPAIGN=${MAX_MEDIA_PER_CAMPAIGN:-5}
+      - MAX_MEDIA_FILE_MB=${MAX_MEDIA_FILE_MB:-3}
+      - MAX_PARALLEL_MEDIA_UPLOADS=${MAX_PARALLEL_MEDIA_UPLOADS:-2}
+      - PROGRESS_UPDATE_INTERVAL_SECONDS=${PROGRESS_UPDATE_INTERVAL_SECONDS:-5}
+      - CLEANUP_CAMPAIGN_FILES_ON_FINISH=${CLEANUP_CAMPAIGN_FILES_ON_FINISH:-true}
+      - DEFAULT_PROFILE=${DEFAULT_PROFILE:-precaucao_100}
+      - SEND_WINDOW=${SEND_WINDOW:-}
+      - MIN_FREE_MEMORY_MB=${MIN_FREE_MEMORY_MB:-256}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./campaigns:/app/campaigns
+    depends_on:
+      - evolution-api
+    networks:
+      - bot-net
+
+volumes:
+  evolution_instances:
+
+networks:
+  bot-net:
+    driver: bridge
