@@ -190,8 +190,9 @@ class Database:
                         UPDATE campaigns
                         SET status = 'failed', finished_at = CURRENT_TIMESTAMP
                         WHERE status IN ('running', 'paused')
-             """
-         )
+                        """
+                    )
+                return ids
 
     async def request_access(self, telegram_id: int, username: str, name: str):
         async with self._lock:
@@ -233,7 +234,6 @@ class Database:
                     "DELETE FROM authorized_users WHERE telegram_id = ? AND approved = 0",
                     (telegram_id,),
                 )
-                return ids
 
     async def set_caption(self, campaign_id: int, caption: str):
         async with self._lock:

@@ -4,6 +4,7 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Dict, Optional
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 from .cleanup import cleanup_campaign_payload
@@ -66,12 +67,33 @@ class CampaignScheduler:
         if not campaign:
             return False
 
+        return await self.cancel_campaign(campaign["id"])
+
+    async def cancel_campaign(self, campaign_id: int) -> bool:
+        campaign = await self.db.get_campaign(campaign_id)
+        if not campaign or campaign["status"] not in ("draft", "ready", "running", "paused"):
+            return False
+
         task = self.tasks.get(campaign["id"])
         if task and not task.done():
             task.cancel()
 
-        await self.db.finish_campaign(campaign["id"], "cancelled")
-        await self._cleanup_campaign_payload(campaign["id"])
+        await self.db.finish_campaign(campaign_id, "cancelled")
+        await self._cleanup_campaign_payload(campaign_id)
+        return True
+
+    async def pause_campaign(self, campaign_id: int) -> bool:
+        campaign = await self.db.get_campaign(campaign_id)
+        if not campaign or campaign["status"] != "running":
+            return False
+        await self.db.set_campaign_status(campaign_id, "paused")
+        return True
+
+    async def resume_campaign(self, campaign_id: int) -> bool:
+        campaign = await self.db.get_campaign(campaign_id)
+        if not campaign or campaign["status"] != "paused":
+            return False
+        await self.db.set_campaign_status(campaign_id, "running")
         return True
 
     async def _run_campaign(self, campaign_id: int, progress_chat_id: Optional[int], progress_message_id: Optional[int]):
@@ -90,12 +112,14 @@ class CampaignScheduler:
             await progress.update(
                 f"Campanha #{campaign_id} iniciada.\n"
                 f"Contatos: 0/{campaign['total_contacts']}\n"
-                "Preparando primeiro envio..."
+                "Preparando primeiro envio...",
+                campaign_controls(campaign_id),
             )
 
             try:
                 while True:
                     await self._wait_for_window()
+                    await self._wait_if_paused(campaign_id, progress)
                     contact = await self.db.next_pending_contact(campaign_id)
                     if not contact:
                         await self.db.finish_campaign(campaign_id, "completed")
@@ -104,7 +128,8 @@ class CampaignScheduler:
                         await progress.update(
                             f"Campanha #{campaign_id} concluida.\n"
                             f"Enviados: {counts['sent']}/{counts['total']}\n"
-                            f"Falhas: {counts['failed']}"
+                            f"Falhas: {counts['failed']}",
+                            None,
                         )
                         return
 
@@ -118,7 +143,8 @@ class CampaignScheduler:
                     await progress.update(
                         f"Campanha #{campaign_id} em andamento.\n"
                         f"Contato {current_number}/{total}: enviando para {contact_name}.\n"
-                        f"Tipo: {relationship}."
+                        f"Tipo: {relationship}.",
+                        campaign_controls(campaign_id),
                     )
 
                     try:
@@ -138,6 +164,7 @@ class CampaignScheduler:
                     if processed_count and processed_count % profile.pause_every == 0:
                         delay = profile.pause()
                         await self._sleep_with_progress(
+                            campaign_id,
                             delay,
                             progress,
                             f"Campanha #{campaign_id} em pausa.\n"
@@ -151,6 +178,7 @@ class CampaignScheduler:
                         next_number = processed_count + 1
                         if next_number <= total:
                             await self._sleep_with_progress(
+                                campaign_id,
                                 delay,
                                 progress,
                                 f"Campanha #{campaign_id} em andamento.\n"
@@ -162,13 +190,13 @@ class CampaignScheduler:
             except asyncio.CancelledError:
                 await self.db.finish_campaign(campaign_id, "cancelled")
                 await self._cleanup_campaign_payload(campaign_id)
-                await progress.update(f"Campanha #{campaign_id} cancelada.")
+                await progress.update(f"Campanha #{campaign_id} cancelada.", None)
                 raise
             except Exception:
                 logger.exception("Erro fatal na campanha %s", campaign_id)
                 await self.db.finish_campaign(campaign_id, "failed")
                 await self._cleanup_campaign_payload(campaign_id)
-                await progress.update(f"Campanha #{campaign_id} falhou.")
+                await progress.update(f"Campanha #{campaign_id} falhou.", None)
 
     async def _send_contact(self, campaign, contact, profile):
         await self._wait_for_memory()
@@ -200,6 +228,17 @@ class CampaignScheduler:
         while not is_inside_window(self.send_window):
             await asyncio.sleep(60)
 
+    async def _wait_if_paused(self, campaign_id: int, progress):
+        while True:
+            campaign = await self.db.get_campaign(campaign_id)
+            if not campaign or campaign["status"] != "paused":
+                return
+            await progress.update(
+                f"Campanha #{campaign_id} pausada.\nUse Retomar para continuar.",
+                campaign_controls(campaign_id, paused=True),
+            )
+            await asyncio.sleep(self.progress_update_interval_seconds)
+
     async def _wait_for_memory(self):
         threshold = self.min_free_memory_mb
         free = available_memory_mb()
@@ -219,10 +258,14 @@ class CampaignScheduler:
             self.cleanup_campaign_files_on_finish,
         )
 
-    async def _sleep_with_progress(self, delay: float, progress, body: str, countdown_label: str):
+    async def _sleep_with_progress(self, campaign_id: int, delay: float, progress, body: str, countdown_label: str):
         remaining = max(0, int(delay))
         while remaining > 0:
-            await progress.update(f"{body}\n{countdown_label}: {remaining}s.")
+            await self._wait_if_paused(campaign_id, progress)
+            await progress.update(
+                f"{body}\n{countdown_label}: {remaining}s.",
+                campaign_controls(campaign_id),
+            )
             step = min(self.progress_update_interval_seconds, remaining)
             await asyncio.sleep(step)
             remaining -= step
@@ -254,25 +297,55 @@ class ProgressMessage:
         self.chat_id = chat_id
         self.message_id = message_id
         self.last_text = ""
+        self.last_markup = None
 
-    async def update(self, text: str):
-        if text == self.last_text:
+    async def update(self, text: str, reply_markup=None):
+        markup_key = str(reply_markup.to_dict()) if reply_markup else ""
+        if text == self.last_text and markup_key == self.last_markup:
             return
 
         self.last_text = text
+        self.last_markup = markup_key
         try:
             if self.message_id:
                 await self.telegram_app.bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=self.message_id,
                     text=text,
+                    reply_markup=reply_markup,
                 )
             else:
                 message = await self.telegram_app.bot.send_message(
                     self.chat_id,
                     text,
                     disable_notification=True,
+                    reply_markup=reply_markup,
                 )
                 self.message_id = message.message_id
         except Exception:
             logger.debug("Nao foi possivel atualizar painel de progresso", exc_info=True)
+
+
+def campaign_controls(campaign_id: int, paused: bool = False) -> InlineKeyboardMarkup:
+    if paused:
+        first = InlineKeyboardButton("Retomar", callback_data=f"campaign_resume:{campaign_id}")
+    else:
+        first = InlineKeyboardButton("Pausar", callback_data=f"campaign_pause:{campaign_id}")
+    return InlineKeyboardMarkup(
+        [[first, InlineKeyboardButton("Cancelar", callback_data=f"campaign_cancel_ask:{campaign_id}")]]
+    )
+
+
+def cancel_confirmation_controls(campaign_id: int, paused: bool = False) -> InlineKeyboardMarkup:
+    keep_label = "Manter pausada" if paused else "Continuar"
+    keep_action = "campaign_cancel_no_paused" if paused else "campaign_cancel_no"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Confirmar cancelamento", callback_data=f"campaign_cancel_yes:{campaign_id}"),
+            ],
+            [
+                InlineKeyboardButton(keep_label, callback_data=f"{keep_action}:{campaign_id}"),
+            ],
+        ]
+    )

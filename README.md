@@ -16,6 +16,8 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 
 - `/start`: mostra o menu basico.
 - `/login`: conecta o WhatsApp da vendedora via QR Code.
+- `/conexao`: mostra o estado atual da conexao WhatsApp da vendedora.
+- `/desconectar`: explica por que o bot nao usa logout automatico como desconexao.
 - `/nova`: cria campanha no perfil de precaucao.
 - `/nova_precaucao`: cria campanha mais cuidadosa, limite padrao de 100 contatos.
 - `/nova_confianca`: cria campanha para clientes habituais/de confianca, limite padrao de 300 contatos.
@@ -25,6 +27,8 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 - `/disparar`: inicia a campanha pronta.
 - `/status`: mostra ultimas campanhas e progresso.
 - `/cancelar`: cancela a campanha ativa da vendedora.
+
+Durante o disparo, a mensagem de progresso tem botoes inline para pausar, retomar e cancelar com confirmacao.
 
 ## Perfis
 

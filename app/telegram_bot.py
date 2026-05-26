@@ -18,7 +18,7 @@ from .csv_utils import mime_from_name, parse_contacts_file, parse_contacts_vcf_t
 from .db import Database
 from .evolution import EvolutionClient
 from .profiles import get_profile
-from .scheduler import CampaignScheduler
+from .scheduler import CampaignScheduler, campaign_controls, cancel_confirmation_controls
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ PERM_STATE_KEY = "perm_state"
 def register_handlers(application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login))
+    application.add_handler(CommandHandler("conexao", conexao))
+    application.add_handler(CommandHandler("desconectar", desconectar))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("disparar", disparar))
     application.add_handler(CallbackQueryHandler(callback_handler))
@@ -94,6 +96,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Bot v2 ativo.\n\n"
             "/login - conectar WhatsApp\n"
+            "/conexao - verificar conexao do WhatsApp\n"
+            "/desconectar - informa limite seguro da Evolution\n"
             "/nova - criar campanha com precaucao\n"
             "/nova_confianca - campanha para contatos de confianca\n"
             "/nova_precaucao - campanha mais cuidadosa\n"
@@ -148,6 +152,28 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def conexao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+
+    _, db, evolution, _ = services(context)
+    user = update.effective_user
+    instance_name = f"vendor_{user.id}"
+    await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
+    state = await evolution.connection_state(instance_name)
+    await update.message.reply_text(f"Conexao WhatsApp: {state}.")
+
+
+async def desconectar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+
+    await update.message.reply_text(
+        "A Evolution 2.4 nesta instalacao nao expoe um endpoint seguro para apenas fechar o socket mantendo a sessao.\n"
+        "O endpoint disponivel e logout, que pode exigir QR novamente. Por isso o bot nao desconecta automaticamente."
+    )
+
+
 async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update, context):
         return ConversationHandler.END
@@ -167,7 +193,21 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = await evolution.connection_state(instance_name)
     if state != "open":
-        await update.message.reply_text("WhatsApp ainda nao esta conectado. Use /login primeiro.")
+        await update.message.reply_text("WhatsApp ainda nao esta conectado. Preparando QR...")
+        try:
+            qr_base64 = await evolution.ensure_fresh_qr(instance_name)
+        except Exception as exc:
+            logger.exception("Erro ao gerar QR")
+            await update.message.reply_text(f"Erro ao gerar QR: {exc}")
+            return ConversationHandler.END
+        if qr_base64:
+            image = base64.b64decode(qr_base64)
+            await update.message.reply_photo(
+                photo=io.BytesIO(image),
+                caption="Escaneie o QR e rode /nova novamente quando a conexao estiver aberta.",
+            )
+        else:
+            await update.message.reply_text("Conexao ainda nao abriu. Rode /conexao para verificar.")
         return ConversationHandler.END
 
     profile_id = profile_from_command(update, settings.default_profile)
@@ -455,6 +495,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
+    if data.startswith("campaign_"):
+        await handle_campaign_callback(update, context)
+        return
+
     if data == "perm_yes":
         await query.answer()
         context.user_data[PERM_STATE_KEY] = "waiting_name"
@@ -499,6 +543,84 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
+
+
+async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    settings, db, _, scheduler = services(context)
+
+    try:
+        action, raw_campaign_id = data.split(":", 1)
+        campaign_id = int(raw_campaign_id)
+    except ValueError:
+        await query.answer("Acao invalida.", show_alert=True)
+        return
+
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign:
+        await query.answer("Campanha nao encontrada.", show_alert=True)
+        return
+
+    is_owner = campaign["vendor_id"] == query.from_user.id
+    if not is_owner and not is_authorized(settings, query.from_user.id):
+        await query.answer("Sem permissao para controlar esta campanha.", show_alert=True)
+        return
+
+    if action == "campaign_pause":
+        ok = await scheduler.pause_campaign(campaign_id)
+        await query.answer("Campanha pausada." if ok else "Nao foi possivel pausar.")
+        if ok:
+            await query.edit_message_text(
+                f"Campanha #{campaign_id} pausada.\nUse Retomar para continuar.",
+                reply_markup=campaign_controls(campaign_id, paused=True),
+            )
+        return
+
+    if action == "campaign_resume":
+        ok = await scheduler.resume_campaign(campaign_id)
+        await query.answer("Campanha retomada." if ok else "Nao foi possivel retomar.")
+        if ok:
+            await query.edit_message_text(
+                f"Campanha #{campaign_id} retomada.\nAguardando proximo envio...",
+                reply_markup=campaign_controls(campaign_id),
+            )
+        return
+
+    if action == "campaign_cancel_ask":
+        paused = campaign["status"] == "paused"
+        await query.answer()
+        await query.edit_message_text(
+            f"Cancelar campanha #{campaign_id}?\nEssa acao nao envia mais contatos.",
+            reply_markup=cancel_confirmation_controls(campaign_id, paused=paused),
+        )
+        return
+
+    if action == "campaign_cancel_no":
+        await query.answer("Cancelamento descartado.")
+        await query.edit_message_text(
+            f"Campanha #{campaign_id} continua em andamento.",
+            reply_markup=campaign_controls(campaign_id),
+        )
+        return
+
+    if action == "campaign_cancel_no_paused":
+        await query.answer("Cancelamento descartado.")
+        await query.edit_message_text(
+            f"Campanha #{campaign_id} continua pausada.",
+            reply_markup=campaign_controls(campaign_id, paused=True),
+        )
+        return
+
+    if action == "campaign_cancel_yes":
+        ok = await scheduler.cancel_campaign(campaign_id)
+        await query.answer("Campanha cancelada." if ok else "Nao foi possivel cancelar.")
+        await query.edit_message_text(
+            f"Campanha #{campaign_id} cancelada." if ok else f"Campanha #{campaign_id} nao estava ativa."
+        )
+        return
+
+    await query.answer("Acao desconhecida.", show_alert=True)
 
 
 async def perm_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
