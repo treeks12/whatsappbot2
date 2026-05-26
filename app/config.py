@@ -51,6 +51,8 @@ class Settings:
     evolution_docker_container: str
     docker_socket_path: str
     evolution_idle_stop_seconds: int
+    contact_list_snapshot_keep: int
+    contact_list_snapshot_days: int
 
 
 def load_settings() -> Settings:
@@ -61,9 +63,9 @@ def load_settings() -> Settings:
         evolution_api_key=os.getenv("EVOLUTION_API_KEY", ""),
         database_path=Path(os.getenv("DATABASE_PATH", "/app/data/bot.sqlite3")),
         campaigns_dir=Path(os.getenv("CAMPAIGNS_DIR", "/app/campaigns")),
-        max_clients_per_campaign=_int_env("MAX_CLIENTS_PER_CAMPAIGN", 100),
-        max_trusted_clients_per_campaign=_int_env("MAX_TRUSTED_CLIENTS_PER_CAMPAIGN", 300),
-        max_precaution_clients_per_campaign=_int_env("MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN", 100),
+        max_clients_per_campaign=_int_env("MAX_CLIENTS_PER_CAMPAIGN", 0),
+        max_trusted_clients_per_campaign=_int_env("MAX_TRUSTED_CLIENTS_PER_CAMPAIGN", 0),
+        max_precaution_clients_per_campaign=_int_env("MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN", 0),
         max_media_per_campaign=_int_env("MAX_MEDIA_PER_CAMPAIGN", 5),
         max_media_file_mb=_int_env("MAX_MEDIA_FILE_MB", 3),
         max_parallel_media_uploads=_int_env("MAX_PARALLEL_MEDIA_UPLOADS", 2),
@@ -76,4 +78,6 @@ def load_settings() -> Settings:
         evolution_docker_container=os.getenv("EVOLUTION_DOCKER_CONTAINER", "evolution-api"),
         docker_socket_path=os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock"),
         evolution_idle_stop_seconds=_int_env("EVOLUTION_IDLE_STOP_SECONDS", 600),
+        contact_list_snapshot_keep=_int_env("CONTACT_LIST_SNAPSHOT_KEEP", 3),
+        contact_list_snapshot_days=_int_env("CONTACT_LIST_SNAPSHOT_DAYS", 14),
     )

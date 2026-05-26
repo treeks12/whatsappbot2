@@ -2,9 +2,12 @@ import base64
 import io
 import logging
 import asyncio
+import csv
+import warnings
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -25,7 +28,16 @@ from .scheduler import CampaignScheduler, campaign_controls, cancel_confirmation
 
 logger = logging.getLogger(__name__)
 
-WAITING_CSV, WAITING_MEDIA, WAITING_CAPTION = range(3)
+(
+    WAITING_CONTACT_SOURCE,
+    WAITING_CSV,
+    WAITING_MEDIA,
+    WAITING_CAPTION,
+    WAITING_LIST_NAME,
+    WAITING_LIST_CONTACTS,
+    WAITING_REMOVE_CONTACTS,
+    WAITING_RENAME_LIST,
+) = range(8)
 PERM_STATE_KEY = "perm_state"
 
 
@@ -36,32 +48,56 @@ def register_handlers(application):
     application.add_handler(CommandHandler("desconectar", desconectar))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("disparar", disparar))
-    application.add_handler(CallbackQueryHandler(callback_handler))
 
-    application.add_handler(
-        ConversationHandler(
-            entry_points=[CommandHandler(["nova", "nova_confianca", "nova_precaucao"], nova)],
-            states={
-                WAITING_CSV: [
-                    MessageHandler(filters.Document.ALL, receive_contacts_file),
-                    MessageHandler(filters.CONTACT, receive_contact_card),
-                    CommandHandler("pronto", contacts_done),
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="If 'per_message=False'.*", category=PTBUserWarning)
+        application.add_handler(
+            ConversationHandler(
+                entry_points=[
+                    CommandHandler(["nova", "nova_confianca", "nova_precaucao"], nova),
+                    CommandHandler("listas", listas),
                 ],
-                WAITING_MEDIA: [
-                    MessageHandler(filters.PHOTO, receive_photo),
-                    MessageHandler(filters.Document.IMAGE, receive_image_document),
-                    CommandHandler("pronto", media_done),
-                    CommandHandler("sem_midia", media_done),
-                ],
-                WAITING_CAPTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, receive_caption),
-                    CommandHandler("sem_texto", receive_no_caption),
-                ],
-            },
-            fallbacks=[CommandHandler("cancelar", cancelar)],
-            allow_reentry=True,
+                states={
+                    WAITING_CONTACT_SOURCE: [
+                        CallbackQueryHandler(handle_contact_source_callback, pattern="^(src_|list_|menu_)"),
+                    ],
+                    WAITING_CSV: [
+                        MessageHandler(filters.Document.ALL, receive_contacts_file),
+                        MessageHandler(filters.CONTACT, receive_contact_card),
+                        CommandHandler("pronto", contacts_done),
+                    ],
+                    WAITING_MEDIA: [
+                        MessageHandler(filters.PHOTO, receive_photo),
+                        MessageHandler(filters.Document.IMAGE, receive_image_document),
+                        CommandHandler("pronto", media_done),
+                        CommandHandler("sem_midia", media_done),
+                    ],
+                    WAITING_CAPTION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_caption),
+                        CommandHandler("sem_texto", receive_no_caption),
+                    ],
+                    WAITING_LIST_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_list_name),
+                    ],
+                    WAITING_LIST_CONTACTS: [
+                        MessageHandler(filters.Document.ALL, receive_list_contacts_file),
+                        MessageHandler(filters.CONTACT, receive_list_contact_card),
+                        CommandHandler("pronto", list_contacts_done),
+                    ],
+                    WAITING_REMOVE_CONTACTS: [
+                        MessageHandler(filters.Document.ALL, receive_remove_contacts_file),
+                        MessageHandler(filters.CONTACT, receive_remove_contact_card),
+                        CommandHandler("pronto", list_remove_done),
+                    ],
+                    WAITING_RENAME_LIST: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rename_list),
+                    ],
+                },
+                fallbacks=[CommandHandler("cancelar", cancelar)],
+                allow_reentry=True,
+            )
         )
-    )
+    application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(CommandHandler("cancelar", cancelar))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, perm_receive_name))
 
@@ -107,6 +143,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/nova - criar campanha com precaucao\n"
             "/nova_confianca - campanha para contatos de confianca\n"
             "/nova_precaucao - campanha mais cuidadosa\n"
+            "/listas - gerenciar listas de contatos\n"
             "/disparar - iniciar campanha pronta\n"
             "/status - ver ultimas campanhas\n"
             "/cancelar - cancelar campanha ativa"
@@ -277,21 +314,19 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     profile_id = profile_from_command(update, settings.default_profile)
-    profile = get_profile(profile_id)
-    contact_limit = contact_limit_for_profile(settings, profile.id)
-    campaign_id = await db.create_campaign(user.id, profile.id)
-    context.user_data["campaign_id"] = campaign_id
-    campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
-
-    await update.message.reply_text(
-        f"Campanha #{campaign_id} criada.\n"
-        f"Perfil: {profile.label}.\n"
-        f"Envie um CSV, VCF bruto, ou ZIP com CSV/VCF dentro.\n"
-        f"Limite: {contact_limit} contatos.\n"
-        "Se o Telegram transformar em cartoes de contato, use /pronto quando terminar."
-    )
+    context.user_data["pending_campaign_profile_id"] = profile_id
+    await show_campaign_contact_source(update.message, db, user.id, profile_id)
     await power.stop_if_idle(db)
-    return WAITING_CSV
+    return WAITING_CONTACT_SOURCE
+
+
+async def listas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    context.user_data.pop("pending_campaign_profile_id", None)
+    await show_lists_menu(update.message, context.application.bot_data["db"], update.effective_user.id)
+    return WAITING_CONTACT_SOURCE
 
 
 def profile_from_command(update: Update, default_profile: str) -> str:
@@ -317,6 +352,495 @@ async def contact_limit_for_campaign(settings: Settings, db: Database, campaign_
     if not campaign:
         return settings.max_clients_per_campaign
     return contact_limit_for_profile(settings, campaign["profile_id"])
+
+
+def contact_limit_label(limit: int) -> str:
+    return "sem limite fixo" if limit <= 0 else f"{limit} contatos"
+
+
+async def show_campaign_contact_source(message, db: Database, vendor_id: int, profile_id: str):
+    profile = get_profile(profile_id)
+    rows = await db.list_contact_lists(vendor_id)
+    keyboard = []
+    if rows:
+        keyboard.append([InlineKeyboardButton("Usar lista salva", callback_data="src_saved")])
+    keyboard.append([InlineKeyboardButton("Criar nova lista", callback_data="src_new_list")])
+    keyboard.append([InlineKeyboardButton("Carregar so para esta campanha", callback_data="src_temp")])
+    await message.reply_text(
+        f"Campanha: {profile.label}.\nComo deseja escolher os contatos?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_lists_menu(message, db: Database, vendor_id: int, *, edit: bool = False):
+    rows = await db.list_contact_lists(vendor_id)
+    keyboard = []
+    for row in rows[:8]:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{row['name']} - {row['total_contacts']}",
+                callback_data=f"list_open:{row['id']}",
+            )
+        ])
+    keyboard.append([InlineKeyboardButton("Criar nova lista", callback_data="list_new")])
+    text = "Suas listas:" if rows else "Voce ainda nao tem listas salvas."
+    if len(rows) > 8:
+        text += f"\nMostrando 8 de {len(rows)} listas."
+    markup = InlineKeyboardMarkup(keyboard)
+    if edit:
+        await message.edit_message_text(text, reply_markup=markup)
+    else:
+        await message.reply_text(text, reply_markup=markup)
+
+
+async def show_saved_lists_for_campaign(query, db: Database, vendor_id: int):
+    rows = await db.list_contact_lists(vendor_id)
+    if not rows:
+        await query.edit_message_text(
+            "Nenhuma lista salva ainda.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Criar nova lista", callback_data="src_new_list")],
+                [InlineKeyboardButton("Carregar so para esta campanha", callback_data="src_temp")],
+            ]),
+        )
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"{row['name']} - {row['total_contacts']}", callback_data=f"src_pick:{row['id']}")]
+        for row in rows[:8]
+    ]
+    keyboard.append([InlineKeyboardButton("Voltar", callback_data="src_back")])
+    await query.edit_message_text("Escolha uma lista:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_selected_list_for_campaign(query, db: Database, vendor_id: int, list_id: int):
+    row = await db.get_contact_list(list_id, vendor_id)
+    if not row:
+        await query.edit_message_text("Lista nao encontrada.")
+        return
+    total = await db.contact_list_count(list_id)
+    await query.edit_message_text(
+        f"Lista: {row['name']}\nContatos: {total}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Usar esta lista", callback_data=f"src_use:{list_id}")],
+            [InlineKeyboardButton("Adicionar contatos nela", callback_data=f"src_add:{list_id}")],
+            [InlineKeyboardButton("Voltar", callback_data="src_saved")],
+        ]),
+    )
+
+
+async def show_contact_list_detail(query, db: Database, vendor_id: int, list_id: int):
+    row = await db.get_contact_list(list_id, vendor_id)
+    if not row:
+        await query.edit_message_text("Lista nao encontrada.")
+        return
+    total = await db.contact_list_count(list_id)
+    await query.edit_message_text(
+        f"{row['name']}\nContatos: {total}\nAtualizada: {row['updated_at']}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Usar em campanha", callback_data=f"list_campaign:{list_id}")],
+            [InlineKeyboardButton("Adicionar contatos", callback_data=f"list_add:{list_id}")],
+            [InlineKeyboardButton("Exportar CSV", callback_data=f"list_export:{list_id}")],
+            [InlineKeyboardButton("Reduzir lista", callback_data=f"list_reduce:{list_id}")],
+            [InlineKeyboardButton("Renomear", callback_data=f"list_rename:{list_id}")],
+            [InlineKeyboardButton("Backups", callback_data=f"list_backups:{list_id}")],
+            [InlineKeyboardButton("Apagar", callback_data=f"list_delete_ask:{list_id}")],
+            [InlineKeyboardButton("Voltar", callback_data="list_menu")],
+        ]),
+    )
+
+
+async def handle_contact_source_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    settings, db, _, _ = services(context)
+    vendor_id = query.from_user.id
+    data = query.data or ""
+
+    if data == "src_back":
+        profile_id = context.user_data.get("pending_campaign_profile_id", settings.default_profile)
+        rows = await db.list_contact_lists(vendor_id)
+        keyboard = []
+        if rows:
+            keyboard.append([InlineKeyboardButton("Usar lista salva", callback_data="src_saved")])
+        keyboard.append([InlineKeyboardButton("Criar nova lista", callback_data="src_new_list")])
+        keyboard.append([InlineKeyboardButton("Carregar so para esta campanha", callback_data="src_temp")])
+        await query.edit_message_text(
+            f"Campanha: {get_profile(profile_id).label}.\nComo deseja escolher os contatos?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return WAITING_CONTACT_SOURCE
+
+    if data == "src_saved":
+        await show_saved_lists_for_campaign(query, db, vendor_id)
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("src_pick:"):
+        await show_selected_list_for_campaign(query, db, vendor_id, int(data.split(":", 1)[1]))
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("src_use:"):
+        await create_campaign_from_list(query, context, int(data.split(":", 1)[1]))
+        return WAITING_MEDIA
+
+    if data.startswith("src_add:"):
+        list_id = int(data.split(":", 1)[1])
+        context.user_data["active_list_id"] = list_id
+        context.user_data["list_flow"] = "campaign_add"
+        await query.edit_message_text(
+            "Envie CSV, VCF bruto, ZIP ou contatos pelo clipe. Use /pronto quando terminar."
+        )
+        return WAITING_LIST_CONTACTS
+
+    if data == "src_new_list" or data == "list_new":
+        context.user_data["list_flow"] = "campaign_new" if context.user_data.get("pending_campaign_profile_id") else "menu_new"
+        await query.edit_message_text("Nome da nova lista:")
+        return WAITING_LIST_NAME
+
+    if data == "src_temp":
+        await create_temp_campaign(query, context)
+        return WAITING_CSV
+
+    if data == "list_menu":
+        await show_lists_menu(query, db, vendor_id, edit=True)
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("list_open:"):
+        await show_contact_list_detail(query, db, vendor_id, int(data.split(":", 1)[1]))
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("list_campaign:"):
+        context.user_data["pending_campaign_profile_id"] = settings.default_profile
+        await create_campaign_from_list(query, context, int(data.split(":", 1)[1]))
+        return WAITING_MEDIA
+
+    if data.startswith("list_add:"):
+        context.user_data["active_list_id"] = int(data.split(":", 1)[1])
+        context.user_data["list_flow"] = "menu_add"
+        await query.edit_message_text(
+            "Envie CSV, VCF bruto, ZIP ou contatos pelo clipe. Use /pronto quando terminar."
+        )
+        return WAITING_LIST_CONTACTS
+
+    if data.startswith("list_export:"):
+        await export_contact_list(query, context, int(data.split(":", 1)[1]))
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("list_reduce:"):
+        context.user_data["active_list_id"] = int(data.split(":", 1)[1])
+        context.user_data["remove_phones"] = []
+        await query.edit_message_text(
+            "Envie CSV, VCF bruto, ZIP ou contatos a remover. Um backup sera criado antes da remocao. Use /pronto quando terminar."
+        )
+        return WAITING_REMOVE_CONTACTS
+
+    if data.startswith("list_rename:"):
+        context.user_data["active_list_id"] = int(data.split(":", 1)[1])
+        await query.edit_message_text("Novo nome da lista:")
+        return WAITING_RENAME_LIST
+
+    if data.startswith("list_backups:"):
+        list_id = int(data.split(":", 1)[1])
+        context.user_data["active_list_id"] = list_id
+        await show_list_backups(query, db, vendor_id, list_id)
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("list_restore:"):
+        snapshot_id = int(data.split(":", 1)[1])
+        try:
+            await db.restore_contact_list_snapshot(snapshot_id, vendor_id)
+        except Exception as exc:
+            await query.edit_message_text(f"Erro ao restaurar backup: {exc}")
+            return ConversationHandler.END
+        await query.edit_message_text("Backup restaurado.")
+        return ConversationHandler.END
+
+    if data.startswith("list_delete_ask:"):
+        list_id = int(data.split(":", 1)[1])
+        row = await db.get_contact_list(list_id, vendor_id)
+        if not row:
+            await query.edit_message_text("Lista nao encontrada.")
+            return ConversationHandler.END
+        await query.edit_message_text(
+            f"Apagar lista '{row['name']}'? Essa acao e permanente.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirmar apagar", callback_data=f"list_delete_yes:{list_id}")],
+                [InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")],
+            ]),
+        )
+        return WAITING_CONTACT_SOURCE
+
+    if data.startswith("list_delete_yes:"):
+        ok = await db.delete_contact_list(int(data.split(":", 1)[1]), vendor_id)
+        await query.edit_message_text("Lista apagada." if ok else "Lista nao encontrada.")
+        return ConversationHandler.END
+
+    return WAITING_CONTACT_SOURCE
+
+
+async def create_temp_campaign(query, context: ContextTypes.DEFAULT_TYPE):
+    settings, db, _, _ = services(context)
+    profile_id = context.user_data.get("pending_campaign_profile_id", settings.default_profile)
+    profile = get_profile(profile_id)
+    contact_limit = contact_limit_for_profile(settings, profile.id)
+    campaign_id = await db.create_campaign(query.from_user.id, profile.id)
+    context.user_data["campaign_id"] = campaign_id
+    campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
+    await query.edit_message_text(
+        f"Campanha #{campaign_id} criada.\n"
+        f"Perfil: {profile.label}.\n"
+        f"Envie CSV, VCF bruto, ou ZIP com CSV/VCF dentro.\n"
+        f"Limite: {contact_limit_label(contact_limit)}.\n"
+        "Se o Telegram transformar em cartoes de contato, use /pronto quando terminar."
+    )
+
+
+async def create_campaign_from_list(query, context: ContextTypes.DEFAULT_TYPE, list_id: int):
+    settings, db, _, _ = services(context)
+    profile_id = context.user_data.get("pending_campaign_profile_id", settings.default_profile)
+    profile = get_profile(profile_id)
+    limit = contact_limit_for_profile(settings, profile.id)
+    if await db.contact_list_count(list_id) <= 0:
+        await query.edit_message_text("A lista nao tem contatos validos.")
+        return
+    campaign_id = await db.create_campaign(query.from_user.id, profile.id)
+    total = await db.copy_contact_list_to_campaign(list_id, query.from_user.id, campaign_id, limit)
+    context.user_data["campaign_id"] = campaign_id
+    campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
+    await query.edit_message_text(
+        f"Campanha #{campaign_id} criada com {total} contatos.\n"
+        "Agora envie imagens, uma por vez, ou use /sem_midia. Quando terminar, use /pronto."
+    )
+
+
+async def receive_list_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, db, _, _ = services(context)
+    user = update.effective_user
+    await db.ensure_vendor(user.id, user.username or f"user_{user.id}", f"vendor_{user.id}")
+    try:
+        list_id = await db.create_contact_list(user.id, update.message.text)
+    except Exception as exc:
+        await update.message.reply_text(str(exc))
+        return WAITING_LIST_NAME
+    context.user_data["active_list_id"] = list_id
+    await update.message.reply_text(
+        "Lista criada. Envie CSV, VCF bruto, ZIP ou contatos pelo clipe. Use /pronto quando terminar."
+    )
+    return WAITING_LIST_CONTACTS
+
+
+async def receive_list_contacts_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, db, _, _ = services(context)
+    list_id = context.user_data.get("active_list_id")
+    if not list_id:
+        await update.message.reply_text("Lista nao encontrada. Use /listas.")
+        return ConversationHandler.END
+
+    try:
+        contacts = await contacts_from_document(update, context, settings, 0)
+        result = await db.import_contacts_to_list(list_id, update.effective_user.id, contacts)
+    except Exception as exc:
+        await update.message.reply_text(str(exc))
+        return WAITING_LIST_CONTACTS
+
+    await update.message.reply_text(import_summary(result) + "\nEnvie mais contatos ou use /pronto.")
+    return WAITING_LIST_CONTACTS
+
+
+async def receive_list_contact_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data["db"]
+    list_id = context.user_data.get("active_list_id")
+    contacts = contacts_from_telegram_contact(update)
+    if not list_id or not contacts:
+        await update.message.reply_text("Contato sem numero completo. Envie arquivo bruto se o Telegram cortar o DDD.")
+        return WAITING_LIST_CONTACTS
+    result = await db.import_contacts_to_list(list_id, update.effective_user.id, contacts)
+    await update.message.reply_text(import_summary(result) + "\nEnvie mais contatos ou use /pronto.")
+    return WAITING_LIST_CONTACTS
+
+
+async def list_contacts_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data["db"]
+    list_id = context.user_data.get("active_list_id")
+    flow = context.user_data.get("list_flow", "")
+    if not list_id:
+        return ConversationHandler.END
+
+    if flow.startswith("campaign"):
+        await update.message.reply_text(
+            "Deseja usar essa lista na campanha?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Usar nesta campanha", callback_data=f"src_use:{list_id}")],
+                [InlineKeyboardButton("Adicionar mais contatos", callback_data=f"src_add:{list_id}")],
+            ]),
+        )
+        return WAITING_CONTACT_SOURCE
+
+    row = await db.get_contact_list(list_id, update.effective_user.id)
+    total = await db.contact_list_count(list_id)
+    await update.message.reply_text(
+        f"Lista '{row['name']}' atualizada.\nContatos: {total}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Abrir lista", callback_data=f"list_open:{list_id}")]]),
+    )
+    return WAITING_CONTACT_SOURCE
+
+
+async def receive_remove_contacts_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, _, _, _ = services(context)
+    try:
+        contacts = await contacts_from_document(update, context, settings, 0)
+    except Exception as exc:
+        await update.message.reply_text(str(exc))
+        return WAITING_REMOVE_CONTACTS
+    phones = context.user_data.setdefault("remove_phones", [])
+    phones.extend(item["phone"] for item in contacts)
+    await update.message.reply_text(f"Marcados para remover: {len(set(phones))}. Envie mais ou use /pronto.")
+    return WAITING_REMOVE_CONTACTS
+
+
+async def receive_remove_contact_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contacts = contacts_from_telegram_contact(update)
+    if not contacts:
+        await update.message.reply_text("Contato sem numero completo. Envie arquivo bruto se o Telegram cortar o DDD.")
+        return WAITING_REMOVE_CONTACTS
+    phones = context.user_data.setdefault("remove_phones", [])
+    phones.extend(item["phone"] for item in contacts)
+    await update.message.reply_text(f"Marcados para remover: {len(set(phones))}. Envie mais ou use /pronto.")
+    return WAITING_REMOVE_CONTACTS
+
+
+async def list_remove_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data["db"]
+    list_id = context.user_data.get("active_list_id")
+    phones = set(context.user_data.get("remove_phones", []))
+    if not list_id or not phones:
+        await update.message.reply_text("Nenhum contato marcado para remover.")
+        return WAITING_REMOVE_CONTACTS
+
+    try:
+        await db.create_contact_list_snapshot(list_id, update.effective_user.id, "antes de reduzir lista")
+        removed = await db.remove_contacts_from_list(list_id, update.effective_user.id, phones)
+    except Exception as exc:
+        await update.message.reply_text(f"Erro ao reduzir lista: {exc}")
+        return ConversationHandler.END
+
+    context.user_data.pop("remove_phones", None)
+    await update.message.reply_text(
+        f"Removidos: {removed}. Backup criado.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Abrir lista", callback_data=f"list_open:{list_id}")]]),
+    )
+    return WAITING_CONTACT_SOURCE
+
+
+async def receive_rename_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data["db"]
+    list_id = context.user_data.get("active_list_id")
+    if not list_id:
+        return ConversationHandler.END
+    try:
+        ok = await db.rename_contact_list(list_id, update.effective_user.id, update.message.text)
+    except Exception as exc:
+        await update.message.reply_text(str(exc))
+        return WAITING_RENAME_LIST
+    await update.message.reply_text(
+        "Lista renomeada." if ok else "Lista nao encontrada.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Abrir lista", callback_data=f"list_open:{list_id}")]]),
+    )
+    return WAITING_CONTACT_SOURCE
+
+
+async def export_contact_list(query, context: ContextTypes.DEFAULT_TYPE, list_id: int):
+    db = context.application.bot_data["db"]
+    row = await db.get_contact_list(list_id, query.from_user.id)
+    if not row:
+        await query.edit_message_text("Lista nao encontrada.")
+        return
+    contacts = await db.contact_list_contacts(list_id, query.from_user.id)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["nome", "telefone"])
+    for contact in contacts:
+        writer.writerow([contact["name"] or "Cliente", contact["phone"]])
+    data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+    data.name = f"lista_{list_id}.csv"
+    await context.bot.send_document(
+        chat_id=query.message.chat_id,
+        document=data,
+        filename=data.name,
+        caption=f"{row['name']} - {len(contacts)} contatos",
+    )
+    await show_contact_list_detail(query, db, query.from_user.id, list_id)
+
+
+async def show_list_backups(query, db: Database, vendor_id: int, list_id: int):
+    context_list = await db.get_contact_list(list_id, vendor_id)
+    if not context_list:
+        await query.edit_message_text("Lista nao encontrada.")
+        return
+    rows = await db.list_contact_list_snapshots(list_id, vendor_id)
+    if not rows:
+        await query.edit_message_text(
+            "Nenhum backup disponivel.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")]]),
+        )
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{row['created_at']} - {row['total_contacts']}",
+                callback_data=f"list_restore:{row['id']}",
+            )
+        ]
+        for row in rows[:5]
+    ]
+    keyboard.append([InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")])
+    await query.edit_message_text("Backups disponiveis:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def contacts_from_document(update: Update, context: ContextTypes.DEFAULT_TYPE, settings: Settings, limit: int) -> list[dict]:
+    document = update.message.document
+    file_name = document.file_name or ""
+    suffix = Path(file_name).suffix.lower()
+    if not document or suffix not in (".csv", ".vcf", ".zip"):
+        raise ValueError("Envie um arquivo .csv, .vcf ou .zip.")
+
+    tmp_dir = settings.campaigns_dir / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    path = tmp_dir / f"{update.effective_user.id}_{document.file_unique_id}{suffix}"
+    file = await context.bot.get_file(document.file_id)
+    await file.download_to_drive(path)
+    try:
+        return parse_contacts_file(path, limit)
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Nao foi possivel apagar arquivo temporario %s", path, exc_info=True)
+
+
+def contacts_from_telegram_contact(update: Update) -> list[dict]:
+    contact = update.message.contact
+    full_name = " ".join(item for item in [contact.first_name, contact.last_name] if item).strip() or "Cliente"
+    contacts = parse_contacts_vcf_text(contact.vcard) if contact.vcard else []
+    if contacts:
+        return contacts
+    phone = usable_phone(contact.phone_number)
+    if not phone:
+        return []
+    return [{"row_index": 0, "name": full_name, "phone": phone}]
+
+
+def import_summary(result: dict) -> str:
+    return (
+        "Lista atualizada.\n"
+        f"Novos: {result['added']}\n"
+        f"Duplicados ignorados: {result['duplicates']}\n"
+        f"Nomes atualizados: {result['updated']}\n"
+        f"Total da lista: {result['total']}"
+    )
 
 
 async def receive_contacts_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,7 +885,7 @@ async def receive_contact_card(update: Update, context: ContextTypes.DEFAULT_TYP
 
     campaign = await db.get_campaign(campaign_id)
     contact_limit = await contact_limit_for_campaign(settings, db, campaign_id)
-    if campaign and campaign["total_contacts"] >= contact_limit:
+    if contact_limit > 0 and campaign and campaign["total_contacts"] >= contact_limit:
         await update.message.reply_text(f"Limite de {contact_limit} contatos atingido. Use /pronto.")
         return WAITING_CSV
 
@@ -385,7 +909,7 @@ async def receive_contact_card(update: Update, context: ContextTypes.DEFAULT_TYP
         return WAITING_CSV
 
     remaining = contact_limit - (campaign["total_contacts"] if campaign else 0)
-    total = await db.add_contacts(campaign_id, contacts[:remaining])
+    total = await db.add_contacts(campaign_id, contacts if contact_limit <= 0 else contacts[:remaining])
     await update.message.reply_text(f"Contato recebido. Total da campanha: {total}. Use /pronto quando terminar.")
     return WAITING_CSV
 
@@ -510,7 +1034,8 @@ async def disparar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update, context):
         return
 
-    _, db, _, scheduler = services(context)
+    _, db, evolution, scheduler = services(context)
+    power = power_service(context)
     campaign = await db.get_active_campaign_for_vendor(update.effective_user.id)
     if not campaign:
         await update.message.reply_text("Nenhuma campanha ativa.")
@@ -518,6 +1043,19 @@ async def disparar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if campaign["status"] != "ready":
         await update.message.reply_text(f"Campanha #{campaign['id']} esta em status {campaign['status']}.")
+        return
+
+    campaign_with_vendor = await db.get_campaign_with_vendor(campaign["id"])
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao ligar Evolution")
+        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
+        return
+    state = await evolution.connection_state(campaign_with_vendor["instance_name"])
+    if state != "open":
+        await update.message.reply_text("WhatsApp nao esta conectado. Use /login antes de disparar.")
+        await power.stop_if_idle(db)
         return
 
     progress_message = await update.message.reply_text("Preparando campanha...")
@@ -564,6 +1102,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("campaign_"):
         await handle_campaign_callback(update, context)
+        return
+
+    if data.startswith(("src_", "list_", "menu_")):
+        await handle_contact_source_callback(update, context)
         return
 
     if data == "perm_yes":

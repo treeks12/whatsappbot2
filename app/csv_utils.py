@@ -120,7 +120,7 @@ def validate_contacts(contacts: list[dict], max_contacts: int, label: str):
     if not contacts:
         raise ValueError(f"{label} sem contatos validos.")
 
-    if len(contacts) > max_contacts:
+    if max_contacts > 0 and len(contacts) > max_contacts:
         raise ValueError(f"{label} tem {len(contacts)} contatos; limite atual e {max_contacts}.")
 
 

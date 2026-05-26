@@ -71,6 +71,51 @@ CREATE TABLE IF NOT EXISTS authorized_users (
     requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     approved_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS contact_lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(vendor_id, name),
+    FOREIGN KEY(vendor_id) REFERENCES vendors(telegram_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS contact_list_contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    list_id INTEGER NOT NULL,
+    name TEXT,
+    phone TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(list_id, phone),
+    FOREIGN KEY(list_id) REFERENCES contact_lists(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS contact_list_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    list_id INTEGER NOT NULL,
+    vendor_id INTEGER NOT NULL,
+    list_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(list_id) REFERENCES contact_lists(id) ON DELETE CASCADE,
+    FOREIGN KEY(vendor_id) REFERENCES vendors(telegram_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS contact_list_snapshot_contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL,
+    name TEXT,
+    phone TEXT NOT NULL,
+    row_index INTEGER NOT NULL,
+    FOREIGN KEY(snapshot_id) REFERENCES contact_list_snapshots(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_lists_vendor ON contact_lists(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_contact_list_contacts_list ON contact_list_contacts(list_id);
+CREATE INDEX IF NOT EXISTS idx_contact_list_snapshots_list ON contact_list_snapshots(list_id, created_at);
 """
 
 
@@ -392,6 +437,358 @@ class Database:
                     (vendor_id,),
                 ).fetchall()
 
+    async def create_contact_list(self, vendor_id: int, name: str) -> int:
+        clean_name = name.strip()[:80]
+        if not clean_name:
+            raise ValueError("Nome da lista vazio.")
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO contact_lists (vendor_id, name)
+                    VALUES (?, ?)
+                    ON CONFLICT(vendor_id, name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (vendor_id, clean_name),
+                )
+                row = conn.execute(
+                    "SELECT id FROM contact_lists WHERE vendor_id = ? AND name = ?",
+                    (vendor_id, clean_name),
+                ).fetchone()
+                return int(row["id"])
+
+    async def list_contact_lists(self, vendor_id: int):
+        async with self._lock:
+            with self.connect() as conn:
+                return conn.execute(
+                    """
+                    SELECT
+                        contact_lists.*,
+                        COUNT(contact_list_contacts.id) AS total_contacts
+                    FROM contact_lists
+                    LEFT JOIN contact_list_contacts ON contact_list_contacts.list_id = contact_lists.id
+                    WHERE contact_lists.vendor_id = ?
+                    GROUP BY contact_lists.id
+                    ORDER BY contact_lists.updated_at DESC, contact_lists.id DESC
+                    """,
+                    (vendor_id,),
+                ).fetchall()
+
+    async def get_contact_list(self, list_id: int, vendor_id: Optional[int] = None):
+        async with self._lock:
+            with self.connect() as conn:
+                if vendor_id is None:
+                    return conn.execute("SELECT * FROM contact_lists WHERE id = ?", (list_id,)).fetchone()
+                return conn.execute(
+                    "SELECT * FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (list_id, vendor_id),
+                ).fetchone()
+
+    async def contact_list_count(self, list_id: int) -> int:
+        async with self._lock:
+            with self.connect() as conn:
+                return int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM contact_list_contacts WHERE list_id = ?",
+                        (list_id,),
+                    ).fetchone()[0]
+                )
+
+    async def rename_contact_list(self, list_id: int, vendor_id: int, name: str) -> bool:
+        clean_name = name.strip()[:80]
+        if not clean_name:
+            raise ValueError("Nome da lista vazio.")
+        async with self._lock:
+            with self.connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE contact_lists
+                    SET name = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND vendor_id = ?
+                    """,
+                    (clean_name, list_id, vendor_id),
+                )
+                return cur.rowcount > 0
+
+    async def delete_contact_list(self, list_id: int, vendor_id: int) -> bool:
+        async with self._lock:
+            with self.connect() as conn:
+                cur = conn.execute("DELETE FROM contact_lists WHERE id = ? AND vendor_id = ?", (list_id, vendor_id))
+                return cur.rowcount > 0
+
+    async def import_contacts_to_list(self, list_id: int, vendor_id: int, contacts: Iterable[dict]) -> dict:
+        async with self._lock:
+            with self.connect() as conn:
+                owner = conn.execute(
+                    "SELECT id FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (list_id, vendor_id),
+                ).fetchone()
+                if not owner:
+                    raise ValueError("Lista nao encontrada.")
+
+                added = 0
+                duplicates = 0
+                updated = 0
+                seen = set()
+                for item in contacts:
+                    phone = item.get("phone")
+                    if not phone or phone in seen:
+                        duplicates += 1
+                        continue
+                    seen.add(phone)
+                    name = (item.get("name") or "Cliente").strip()[:120]
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO contact_list_contacts (list_id, name, phone) VALUES (?, ?, ?)",
+                        (list_id, name, phone),
+                    )
+                    if cur.rowcount:
+                        added += 1
+                        continue
+
+                    row = conn.execute(
+                        "SELECT id, name FROM contact_list_contacts WHERE list_id = ? AND phone = ?",
+                        (list_id, phone),
+                    ).fetchone()
+                    duplicates += 1
+                    if row and _generic_name(row["name"]) and not _generic_name(name):
+                        conn.execute(
+                            """
+                            UPDATE contact_list_contacts
+                            SET name = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (name, row["id"]),
+                        )
+                        updated += 1
+
+                conn.execute(
+                    "UPDATE contact_lists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (list_id,),
+                )
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM contact_list_contacts WHERE list_id = ?",
+                    (list_id,),
+                ).fetchone()[0]
+                return {"added": added, "duplicates": duplicates, "updated": updated, "total": int(total)}
+
+    async def contact_list_contacts(self, list_id: int, vendor_id: int, limit: int = 0):
+        async with self._lock:
+            with self.connect() as conn:
+                owner = conn.execute(
+                    "SELECT id FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (list_id, vendor_id),
+                ).fetchone()
+                if not owner:
+                    return []
+                sql = """
+                    SELECT name, phone
+                    FROM contact_list_contacts
+                    WHERE list_id = ?
+                    ORDER BY id
+                """
+                params: tuple = (list_id,)
+                if limit > 0:
+                    sql += " LIMIT ?"
+                    params = (list_id, limit)
+                return conn.execute(sql, params).fetchall()
+
+    async def copy_contact_list_to_campaign(self, list_id: int, vendor_id: int, campaign_id: int, limit: int = 0) -> int:
+        async with self._lock:
+            with self.connect() as conn:
+                owner = conn.execute(
+                    "SELECT id FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (list_id, vendor_id),
+                ).fetchone()
+                campaign = conn.execute(
+                    "SELECT id FROM campaigns WHERE id = ? AND vendor_id = ?",
+                    (campaign_id, vendor_id),
+                ).fetchone()
+                if not owner or not campaign:
+                    raise ValueError("Lista ou campanha nao encontrada.")
+
+                rows = conn.execute(
+                    """
+                    SELECT name, phone
+                    FROM contact_list_contacts
+                    WHERE list_id = ?
+                    ORDER BY id
+                    """ + (" LIMIT ?" if limit > 0 else ""),
+                    (list_id, limit) if limit > 0 else (list_id,),
+                ).fetchall()
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO contacts (campaign_id, row_index, name, phone)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [(campaign_id, index, row["name"], row["phone"]) for index, row in enumerate(rows)],
+                )
+                total = conn.execute("SELECT COUNT(*) FROM contacts WHERE campaign_id = ?", (campaign_id,)).fetchone()[0]
+                conn.execute("UPDATE campaigns SET total_contacts = ? WHERE id = ?", (total, campaign_id))
+                return int(total)
+
+    async def create_contact_list_snapshot(self, list_id: int, vendor_id: int, reason: str) -> int:
+        async with self._lock:
+            with self.connect() as conn:
+                contact_list = conn.execute(
+                    "SELECT * FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (list_id, vendor_id),
+                ).fetchone()
+                if not contact_list:
+                    raise ValueError("Lista nao encontrada.")
+                cur = conn.execute(
+                    """
+                    INSERT INTO contact_list_snapshots (list_id, vendor_id, list_name, reason)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (list_id, vendor_id, contact_list["name"], reason[:120]),
+                )
+                snapshot_id = int(cur.lastrowid)
+                rows = conn.execute(
+                    "SELECT name, phone FROM contact_list_contacts WHERE list_id = ? ORDER BY id",
+                    (list_id,),
+                ).fetchall()
+                conn.executemany(
+                    """
+                    INSERT INTO contact_list_snapshot_contacts (snapshot_id, name, phone, row_index)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [(snapshot_id, row["name"], row["phone"], index) for index, row in enumerate(rows)],
+                )
+                return snapshot_id
+
+    async def list_contact_list_snapshots(self, list_id: int, vendor_id: int):
+        async with self._lock:
+            with self.connect() as conn:
+                return conn.execute(
+                    """
+                    SELECT
+                        contact_list_snapshots.*,
+                        COUNT(contact_list_snapshot_contacts.id) AS total_contacts
+                    FROM contact_list_snapshots
+                    LEFT JOIN contact_list_snapshot_contacts
+                        ON contact_list_snapshot_contacts.snapshot_id = contact_list_snapshots.id
+                    WHERE contact_list_snapshots.list_id = ?
+                      AND contact_list_snapshots.vendor_id = ?
+                    GROUP BY contact_list_snapshots.id
+                    ORDER BY contact_list_snapshots.created_at DESC, contact_list_snapshots.id DESC
+                    """,
+                    (list_id, vendor_id),
+                ).fetchall()
+
+    async def restore_contact_list_snapshot(self, snapshot_id: int, vendor_id: int) -> int:
+        async with self._lock:
+            with self.connect() as conn:
+                snapshot = conn.execute(
+                    """
+                    SELECT * FROM contact_list_snapshots
+                    WHERE id = ? AND vendor_id = ?
+                    """,
+                    (snapshot_id, vendor_id),
+                ).fetchone()
+                if not snapshot:
+                    raise ValueError("Backup nao encontrado.")
+                contact_list = conn.execute(
+                    "SELECT id FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (snapshot["list_id"], vendor_id),
+                ).fetchone()
+                if not contact_list:
+                    raise ValueError("Lista do backup nao existe mais.")
+
+                current = conn.execute(
+                    "SELECT name, phone FROM contact_list_contacts WHERE list_id = ? ORDER BY id",
+                    (snapshot["list_id"],),
+                ).fetchall()
+                cur = conn.execute(
+                    """
+                    INSERT INTO contact_list_snapshots (list_id, vendor_id, list_name, reason)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (snapshot["list_id"], vendor_id, snapshot["list_name"], "antes de restaurar backup"),
+                )
+                current_snapshot_id = int(cur.lastrowid)
+                conn.executemany(
+                    """
+                    INSERT INTO contact_list_snapshot_contacts (snapshot_id, name, phone, row_index)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (current_snapshot_id, row["name"], row["phone"], index)
+                        for index, row in enumerate(current)
+                    ],
+                )
+
+                conn.execute("DELETE FROM contact_list_contacts WHERE list_id = ?", (snapshot["list_id"],))
+                rows = conn.execute(
+                    """
+                    SELECT name, phone
+                    FROM contact_list_snapshot_contacts
+                    WHERE snapshot_id = ?
+                    ORDER BY row_index
+                    """,
+                    (snapshot_id,),
+                ).fetchall()
+                conn.executemany(
+                    "INSERT INTO contact_list_contacts (list_id, name, phone) VALUES (?, ?, ?)",
+                    [(snapshot["list_id"], row["name"], row["phone"]) for row in rows],
+                )
+                conn.execute(
+                    "UPDATE contact_lists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (snapshot["list_id"],),
+                )
+                return len(rows)
+
+    async def remove_contacts_from_list(self, list_id: int, vendor_id: int, phones: Iterable[str]) -> int:
+        unique_phones = sorted({phone for phone in phones if phone})
+        if not unique_phones:
+            return 0
+        async with self._lock:
+            with self.connect() as conn:
+                owner = conn.execute(
+                    "SELECT id FROM contact_lists WHERE id = ? AND vendor_id = ?",
+                    (list_id, vendor_id),
+                ).fetchone()
+                if not owner:
+                    raise ValueError("Lista nao encontrada.")
+                removed = 0
+                for phone in unique_phones:
+                    cur = conn.execute(
+                        "DELETE FROM contact_list_contacts WHERE list_id = ? AND phone = ?",
+                        (list_id, phone),
+                    )
+                    removed += cur.rowcount
+                conn.execute("UPDATE contact_lists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (list_id,))
+                return int(removed)
+
+    async def prune_contact_list_snapshots(self, keep_per_list: int, max_age_days: int):
+        async with self._lock:
+            with self.connect() as conn:
+                if max_age_days > 0:
+                    conn.execute(
+                        """
+                        DELETE FROM contact_list_snapshots
+                        WHERE created_at < datetime('now', ?)
+                        """,
+                        (f"-{max_age_days} days",),
+                    )
+                if keep_per_list > 0:
+                    rows = conn.execute("SELECT id FROM contact_lists").fetchall()
+                    for row in rows:
+                        old = conn.execute(
+                            """
+                            SELECT id
+                            FROM contact_list_snapshots
+                            WHERE list_id = ?
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT -1 OFFSET ?
+                            """,
+                            (row["id"], keep_per_list),
+                        ).fetchall()
+                        if old:
+                            conn.executemany(
+                                "DELETE FROM contact_list_snapshots WHERE id = ?",
+                                [(item["id"],) for item in old],
+                            )
+
     def _cleanup_orphan_records(self, conn: sqlite3.Connection):
         conn.execute(
             """
@@ -402,6 +799,14 @@ class Database:
         )
         conn.execute("DELETE FROM media WHERE campaign_id NOT IN (SELECT id FROM campaigns)")
         conn.execute("DELETE FROM contacts WHERE campaign_id NOT IN (SELECT id FROM campaigns)")
+        conn.execute("DELETE FROM contact_list_contacts WHERE list_id NOT IN (SELECT id FROM contact_lists)")
+        conn.execute("DELETE FROM contact_list_snapshots WHERE list_id NOT IN (SELECT id FROM contact_lists)")
+        conn.execute(
+            """
+            DELETE FROM contact_list_snapshot_contacts
+            WHERE snapshot_id NOT IN (SELECT id FROM contact_list_snapshots)
+            """
+        )
 
     def _refresh_campaign_counters(self, conn: sqlite3.Connection):
         conn.execute(
@@ -421,3 +826,7 @@ class Database:
                 )
             """
         )
+
+
+def _generic_name(name: Optional[str]) -> bool:
+    return not name or name.strip().lower() in ("cliente", "contato", "sem nome")

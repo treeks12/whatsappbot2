@@ -42,3 +42,13 @@ async def cleanup_orphan_campaign_dirs(db: Database, campaigns_dir: Path, enable
         campaign_id = int(child.name)
         if campaign_id not in existing_ids:
             remove_campaign_dir(campaigns_dir, campaign_id)
+
+
+def cleanup_tmp_import_dir(campaigns_dir: Path):
+    tmp_dir = (campaigns_dir / "_tmp").resolve()
+    base = campaigns_dir.resolve()
+    if not tmp_dir.exists():
+        return
+    if base == tmp_dir or base not in tmp_dir.parents:
+        raise ValueError(f"Diretorio temporario invalido para limpeza: {tmp_dir}")
+    shutil.rmtree(tmp_dir)

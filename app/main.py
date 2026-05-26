@@ -3,7 +3,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application
 
-from .cleanup import cleanup_campaign_payload, cleanup_orphan_campaign_dirs
+from .cleanup import cleanup_campaign_payload, cleanup_orphan_campaign_dirs, cleanup_tmp_import_dir
 from .config import load_settings
 from .db import Database
 from .docker_control import DockerControl
@@ -30,6 +30,10 @@ async def post_init(application: Application):
     settings.campaigns_dir.mkdir(parents=True, exist_ok=True)
     try:
         await db.setup()
+        await db.prune_contact_list_snapshots(
+            settings.contact_list_snapshot_keep,
+            settings.contact_list_snapshot_days,
+        )
     except Exception as exc:
         logger.exception("DB setup failed")
         raise
@@ -53,6 +57,7 @@ async def post_init(application: Application):
         settings.campaigns_dir,
         settings.cleanup_campaign_files_on_finish,
     )
+    cleanup_tmp_import_dir(settings.campaigns_dir)
     await evolution.start()
     await power.start()
     await power.stop_if_idle(db)

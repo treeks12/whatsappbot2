@@ -19,8 +19,9 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 - `/conexao`: mostra o estado atual da conexao WhatsApp da vendedora.
 - `/desconectar`: tenta desconectar a sessao sem logout; se a Evolution nao suportar, desliga o container mantendo a sessao.
 - `/nova`: cria campanha no perfil de precaucao.
-- `/nova_precaucao`: cria campanha mais cuidadosa, limite padrao de 100 contatos.
-- `/nova_confianca`: cria campanha para clientes habituais/de confianca, limite padrao de 300 contatos.
+- `/nova_precaucao`: cria campanha mais cuidadosa.
+- `/nova_confianca`: cria campanha para clientes habituais/de confianca.
+- `/listas`: cria, incrementa, exporta, reduz e restaura listas de contatos da vendedora.
 - `/pronto`: confirma a etapa atual, como terminar contatos ou terminar imagens.
 - `/sem_midia`: pula imagens e vai direto para texto.
 - `/sem_texto`: depois das imagens, deixa a campanha pronta sem legenda/texto.
@@ -40,7 +41,7 @@ Use com listas que exigem mais cuidado.
 - Clientes ja conhecidos pelo historico do bot: 10 a 25s.
 - Entre fotos da mesma pessoa: 2 a 6s.
 - Pausa maior: a cada 30 contatos, por 120 a 300s.
-- Limite padrao: 100 contatos.
+- Limite padrao: sem limite fixo (`0` no `.env`). Use `MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN` se quiser limitar.
 
 ### Confianca
 
@@ -50,7 +51,7 @@ Use apenas para clientes habituais, que reconhecem o numero/loja e com quem ja e
 - Clientes ja conhecidos pelo historico do bot: 5 a 12s.
 - Entre fotos da mesma pessoa: 1 a 3s.
 - Pausa maior: a cada 75 contatos, por 60 a 120s.
-- Limite padrao: 300 contatos.
+- Limite padrao: sem limite fixo (`0` no `.env`). Use `MAX_TRUSTED_CLIENTS_PER_CAMPAIGN` se quiser limitar.
 
 ## Arquivo `.env`
 
@@ -61,12 +62,14 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ADMIN_IDS=...
 EVOLUTION_API_URL=...
 EVOLUTION_API_KEY=...
-MAX_TRUSTED_CLIENTS_PER_CAMPAIGN=300
-MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN=100
+MAX_TRUSTED_CLIENTS_PER_CAMPAIGN=0
+MAX_PRECAUTION_CLIENTS_PER_CAMPAIGN=0
 MAX_MEDIA_FILE_MB=3
 MAX_PARALLEL_MEDIA_UPLOADS=2
 PROGRESS_UPDATE_INTERVAL_SECONDS=5
 CLEANUP_CAMPAIGN_FILES_ON_FINISH=true
+CONTACT_LIST_SNAPSHOT_KEEP=3
+CONTACT_LIST_SNAPSHOT_DAYS=14
 DEFAULT_PROFILE=precaucao_100
 SEND_WINDOW=
 ```
@@ -118,6 +121,12 @@ Smoke test da Evolution:
 docker exec -w /app whatsapp-bot-v2 python -m app.smoke_evolution
 ```
 
+Smoke test das listas:
+
+```powershell
+docker exec -w /app whatsapp-bot-v2 python -m app.smoke_contact_lists
+```
+
 ## Fluxo De Uso
 
 1. No Telegram, use `/login`.
@@ -134,7 +143,7 @@ ou:
 /nova_confianca
 ```
 
-4. Envie CSV, VCF bruto ou ZIP com CSV/VCF.
+4. Escolha uma lista salva, crie uma nova lista, ou carregue contatos so para a campanha.
 5. Use `/pronto` se estiver enviando contatos soltos pelo Telegram.
 6. Envie imagens, ou use `/sem_midia`.
 7. Use `/pronto`.
@@ -163,6 +172,24 @@ nome, name, cliente
 ```
 
 VCF de iPhone/Android tambem e aceito. Se o Telegram transformar o VCF em cartoes de contato e comer DDD, envie o VCF dentro de um ZIP.
+
+## Listas De Contatos
+
+Cada vendedora tem as proprias listas. No fluxo `/nova`, `/nova_confianca` ou `/nova_precaucao`, o bot oferece usar lista salva, criar lista nova, adicionar contatos a uma lista existente, ou carregar contatos apenas para aquela campanha.
+
+O telefone normalizado e a chave de duplicidade. Nome repetido nao bloqueia importacao. Se o telefone ja existir, o bot ignora o contato; ele so atualiza o nome quando o nome antigo era generico como `Cliente`.
+
+O menu `/listas` permite:
+
+- criar lista;
+- adicionar contatos por CSV, VCF, ZIP ou contatos do Telegram;
+- exportar CSV limpo;
+- reduzir lista enviando arquivo/contatos a remover;
+- renomear;
+- restaurar backups;
+- apagar lista.
+
+Antes de reduzir ou restaurar uma lista, o bot cria backup automatico. Por padrao, guarda ate 3 backups por lista por ate 14 dias, evitando acumular lixo.
 
 ## VPS Pequena
 
