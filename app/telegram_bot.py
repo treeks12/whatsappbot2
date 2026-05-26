@@ -3,7 +3,7 @@ import io
 import logging
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -18,7 +18,7 @@ from .csv_utils import mime_from_name, parse_contacts_file, parse_contacts_vcf_t
 from .db import Database
 from .evolution import EvolutionClient
 from .profiles import get_profile
-from .scheduler import CampaignScheduler
+from .scheduler import CampaignScheduler, campaign_controls
 
 
 logger = logging.getLogger(__name__)
@@ -404,6 +404,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _, db, _, _ = services(context)
+    active = await db.get_active_campaign_for_vendor(update.effective_user.id)
+    if active and active["status"] in ("running", "paused"):
+        counts = await db.campaign_progress(active["id"])
+        await update.message.reply_text(
+            render_campaign_status(active, counts),
+            reply_markup=campaign_controls(active["id"], active["status"]),
+        )
+        return
+
     rows = await db.campaign_summary_for_vendor(update.effective_user.id)
     if not rows:
         await update.message.reply_text("Nenhuma campanha encontrada.")
@@ -432,7 +441,110 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
+    query = update.callback_query
+    data = query.data or ""
+
+    if data.startswith("campaign_"):
+        await handle_campaign_callback(update, context)
+        return
+
+    await query.answer()
+
+
+async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    try:
+        action, raw_campaign_id = data.split(":", 1)
+        campaign_id = int(raw_campaign_id)
+    except ValueError:
+        await query.answer("Botao invalido.", show_alert=True)
+        return
+
+    _, db, _, scheduler = services(context)
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign or campaign["vendor_id"] != user_id:
+        await query.answer("Campanha nao encontrada.", show_alert=True)
+        return
+
+    if action == "campaign_pause":
+        ok = await scheduler.pause_vendor_campaign(user_id, campaign_id)
+        await query.answer("Campanha pausada." if ok else "Nao foi possivel pausar.")
+        await refresh_campaign_panel(query, db, campaign_id)
+        return
+
+    if action == "campaign_resume":
+        ok = await scheduler.resume_vendor_campaign(user_id, campaign_id)
+        await query.answer("Campanha retomada." if ok else "Nao foi possivel retomar.")
+        await refresh_campaign_panel(query, db, campaign_id)
+        return
+
+    if action == "campaign_status":
+        await query.answer()
+        await refresh_campaign_panel(query, db, campaign_id)
+        return
+
+    if action == "campaign_cancel_confirm":
+        await query.answer()
+        await query.edit_message_text(
+            f"Tem certeza que deseja cancelar a campanha #{campaign_id}?\n\n"
+            "Isso vai encerrar a campanha e impedir novos envios.\n"
+            "Os contatos ja enviados continuarao registrados.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Sim, cancelar", callback_data=f"campaign_cancel:{campaign_id}"),
+                    InlineKeyboardButton("↩️ Voltar", callback_data=f"campaign_status:{campaign_id}"),
+                ]
+            ]),
+        )
+        return
+
+    if action == "campaign_cancel":
+        ok = await scheduler.cancel_vendor_campaign(user_id, campaign_id)
+        await query.answer("Campanha cancelada." if ok else "Nao foi possivel cancelar.")
+        await query.edit_message_text("Campanha cancelada." if ok else "Nenhuma campanha ativa para cancelar.")
+        return
+
+    await query.answer("Acao desconhecida.", show_alert=True)
+
+
+async def refresh_campaign_panel(query, db: Database, campaign_id: int):
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign:
+        await query.edit_message_text("Campanha nao encontrada.")
+        return
+
+    counts = await db.campaign_progress(campaign_id)
+    await query.edit_message_text(
+        render_campaign_status(campaign, counts),
+        reply_markup=campaign_controls(campaign_id, campaign["status"]),
+    )
+
+
+def render_campaign_status(campaign, counts: dict) -> str:
+    status_labels = {
+        "draft": "rascunho",
+        "ready": "pronta",
+        "running": "em andamento",
+        "paused": "pausada",
+        "completed": "concluida",
+        "cancelled": "cancelada",
+        "failed": "falhou",
+    }
+    status = status_labels.get(campaign["status"], campaign["status"])
+    extra = ""
+    if campaign["status"] == "paused":
+        extra = "\n\nWhatsApp liberado para uso.\nUse ▶️ Continuar para retomar."
+
+    return (
+        f"Campanha #{campaign['id']}\n"
+        f"Status: {status}\n"
+        f"Progresso: {counts['processed']}/{counts['total']}\n"
+        f"Enviados: {counts['sent']} | Falhas: {counts['failed']}"
+        f"{extra}"
+    )
 
 
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:
