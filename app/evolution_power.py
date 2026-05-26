@@ -73,9 +73,14 @@ class EvolutionPowerManager:
         last_error = None
         while asyncio.get_running_loop().time() < deadline:
             try:
-                await self.evolution.license_status()
+                await self.evolution.info()
                 return
             except Exception as exc:
                 last_error = exc
+                try:
+                    await self.evolution.license_status()
+                    return
+                except Exception as license_exc:
+                    last_error = license_exc
                 await asyncio.sleep(2)
         raise DockerControlError(f"Evolution API nao respondeu em {timeout_seconds}s: {last_error}")

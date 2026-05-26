@@ -9,11 +9,15 @@ from telegram.ext import Application
 
 from .cleanup import cleanup_campaign_payload
 from .db import Database
-from .evolution import EvolutionClient
+from .evolution import EvolutionClient, file_to_base64
 from .profiles import get_profile
 
 
 logger = logging.getLogger(__name__)
+
+
+class CampaignConnectionLost(RuntimeError):
+    pass
 
 
 def available_memory_mb() -> float:
@@ -62,7 +66,12 @@ class CampaignScheduler:
 
         task = asyncio.create_task(self._run_campaign(campaign_id, progress_chat_id, progress_message_id))
         self.tasks[campaign_id] = task
+        task.add_done_callback(lambda done_task, cid=campaign_id: self._clear_task(cid, done_task))
         return True
+
+    def _clear_task(self, campaign_id: int, task: asyncio.Task):
+        if self.tasks.get(campaign_id) is task:
+            self.tasks.pop(campaign_id, None)
 
     async def cancel_vendor_campaign(self, vendor_id: int) -> bool:
         campaign = await self.db.get_active_campaign_for_vendor(vendor_id)
@@ -120,7 +129,10 @@ class CampaignScheduler:
 
             try:
                 await self._ensure_evolution_running()
+                await self._ensure_connection_open(instance_name)
                 await self.db.start_campaign(campaign_id)
+                media_items = await self.db.get_media(campaign_id)
+                media_cache: Dict[str, str] = {}
                 await progress.update(
                     f"Campanha #{campaign_id} iniciada.\n"
                     f"Contatos: 0/{campaign['total_contacts']}\n"
@@ -131,6 +143,7 @@ class CampaignScheduler:
                 while True:
                     await self._wait_for_window()
                     await self._wait_if_paused(campaign_id, progress)
+                    await self._ensure_connection_open(instance_name)
                     contact = await self.db.next_pending_contact(campaign_id)
                     if not contact:
                         await self.db.finish_campaign(campaign_id, "completed")
@@ -159,12 +172,14 @@ class CampaignScheduler:
                     )
 
                     try:
-                        await self._send_contact(campaign, contact, profile)
+                        await self._send_contact(campaign, contact, profile, media_items, media_cache)
                         await self.db.mark_contact_sent(campaign_id, contact["id"], contact["phone"])
                         result_line = f"Contato {current_number}/{total} enviado."
                     except Exception as exc:
+                        if await self._connection_closed(instance_name):
+                            raise CampaignConnectionLost("WhatsApp desconectou durante a campanha.") from exc
                         logger.exception("Erro ao enviar contato %s", contact["id"])
-                        await self.db.mark_contact_failed(contact["id"], str(exc))
+                        await self.db.mark_contact_failed(campaign_id, contact["id"], str(exc))
                         result_line = f"Contato {current_number}/{total} falhou. Pulando para o proximo."
 
                     counts = await self.db.campaign_progress(campaign_id)
@@ -203,6 +218,15 @@ class CampaignScheduler:
                 await self._cleanup_campaign_payload(campaign_id)
                 await progress.update(f"Campanha #{campaign_id} cancelada.", None)
                 raise
+            except CampaignConnectionLost as exc:
+                logger.warning("Campanha %s interrompida por desconexao: %s", campaign_id, exc)
+                await self.db.finish_campaign(campaign_id, "failed")
+                await self._cleanup_campaign_payload(campaign_id)
+                await progress.update(
+                    f"Campanha #{campaign_id} interrompida.\n"
+                    "WhatsApp desconectou antes de continuar. Nenhum contato restante foi marcado como falha.",
+                    None,
+                )
             except Exception:
                 logger.exception("Erro fatal na campanha %s", campaign_id)
                 await self.db.finish_campaign(campaign_id, "failed")
@@ -211,14 +235,17 @@ class CampaignScheduler:
             finally:
                 await self._stop_evolution_if_idle()
 
-    async def _send_contact(self, campaign, contact, profile):
+    async def _send_contact(self, campaign, contact, profile, media_items, media_cache: Dict[str, str]):
         await self._wait_for_memory()
-        media_items = await self.db.get_media(campaign["id"])
         text = (campaign["caption"] or "").replace("{nome}", contact["name"] or "Cliente")
 
         for index, media in enumerate(media_items):
             is_last_media = index == len(media_items) - 1
             await self._wait_for_memory()
+            media_base64 = media_cache.get(media["path"])
+            if media_base64 is None:
+                media_base64 = await file_to_base64(media["path"])
+                media_cache[media["path"]] = media_base64
             await self.evolution.send_media(
                 campaign["instance_name"],
                 contact["phone"],
@@ -226,6 +253,7 @@ class CampaignScheduler:
                 media["mime_type"],
                 media["file_name"],
                 text if is_last_media else "",
+                media_base64,
             )
             if index < len(media_items) - 1:
                 await asyncio.sleep(profile.between_media())
@@ -274,6 +302,14 @@ class CampaignScheduler:
     async def _ensure_evolution_running(self):
         if self.evolution_power:
             await self.evolution_power.ensure_running()
+
+    async def _ensure_connection_open(self, instance_name: str):
+        if await self._connection_closed(instance_name):
+            raise CampaignConnectionLost("WhatsApp nao esta conectado.")
+
+    async def _connection_closed(self, instance_name: str) -> bool:
+        state = await self.evolution.connection_state(instance_name)
+        return state != "open"
 
     async def _stop_evolution_if_idle(self):
         if self.evolution_power:

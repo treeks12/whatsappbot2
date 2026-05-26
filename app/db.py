@@ -354,16 +354,13 @@ class Database:
                     "INSERT OR IGNORE INTO sent_messages (campaign_id, contact_id, phone) VALUES (?, ?, ?)",
                     (campaign_id, contact_id, phone),
                 )
-                sent_count = conn.execute(
-                    "SELECT COUNT(*) FROM contacts WHERE campaign_id = ? AND status = 'sent'",
-                    (campaign_id,),
-                ).fetchone()[0]
-                conn.execute("UPDATE campaigns SET sent_count = ?, current_index = ? WHERE id = ?", (sent_count, sent_count, campaign_id))
+                self._refresh_campaign_counter(conn, campaign_id)
 
-    async def mark_contact_failed(self, contact_id: int, error: str):
+    async def mark_contact_failed(self, campaign_id: int, contact_id: int, error: str):
         async with self._lock:
             with self.connect() as conn:
                 conn.execute("UPDATE contacts SET status = 'failed', error = ? WHERE id = ?", (error[:500], contact_id))
+                self._refresh_campaign_counter(conn, campaign_id)
 
     async def phone_has_previous_success(self, phone: str, current_campaign_id: int) -> bool:
         async with self._lock:
@@ -825,6 +822,32 @@ class Database:
                     WHERE contacts.campaign_id = campaigns.id AND contacts.status IN ('sent', 'failed')
                 )
             """
+        )
+
+    def _refresh_campaign_counter(self, conn: sqlite3.Connection, campaign_id: int):
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN status IN ('sent', 'failed') THEN 1 ELSE 0 END) AS processed
+            FROM contacts
+            WHERE campaign_id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET total_contacts = ?, sent_count = ?, current_index = ?
+            WHERE id = ?
+            """,
+            (
+                int(row["total"] or 0),
+                int(row["sent"] or 0),
+                int(row["processed"] or 0),
+                campaign_id,
+            ),
         )
 
 

@@ -57,6 +57,12 @@ class EvolutionClient:
             "instanceName": instance_name,
             "qrcode": True,
             "integration": "WHATSAPP-BAILEYS",
+            "rejectCall": True,
+            "groupsIgnore": True,
+            "alwaysOnline": False,
+            "readMessages": False,
+            "readStatus": False,
+            "syncFullHistory": False,
         }
         return await self._request("POST", "/instance/create", json=payload)
 
@@ -67,19 +73,13 @@ class EvolutionClient:
         return await self._request("GET", f"/instance/connect/{instance_name}")
 
     async def disconnect_instance(self, instance_name: str) -> bool:
-        attempts = (
-            ("POST", f"/instance/disconnect/{instance_name}"),
-            ("DELETE", f"/instance/disconnect/{instance_name}"),
-            ("POST", f"/instance/disconnect", {"instanceName": instance_name}),
-            ("DELETE", f"/instance/disconnect", {"instanceName": instance_name}),
-        )
-        for method, path, *payload in attempts:
-            try:
-                await self._request(method, path, json=payload[0] if payload else None)
-                return True
-            except EvolutionError:
-                continue
+        # Evolution v2 exposes logout endpoints, but logout can unpair the phone.
+        # For "disconnect without losing session" the safe local action is stopping
+        # the Evolution container, handled by the caller as fallback.
         return False
+
+    async def info(self) -> Dict[str, Any]:
+        return await self._request("GET", "/")
 
     async def connection_state(self, instance_name: str) -> str:
         try:
@@ -138,9 +138,10 @@ class EvolutionClient:
         mime_type: str,
         file_name: str,
         caption: str = "",
+        media_base64: Optional[str] = None,
     ):
         async with self.media_semaphore:
-            media = await file_to_base64(media_path)
+            media = media_base64 if media_base64 is not None else await file_to_base64(media_path)
             payload = {
                 "number": normalize_phone(phone),
                 "mediatype": "image",

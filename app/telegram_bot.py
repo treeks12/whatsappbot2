@@ -225,6 +225,7 @@ async def conexao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state = await evolution.connection_state(instance_name)
     await update.message.reply_text(f"Conexao WhatsApp: {state}.")
+    schedule_idle_stop(context)
 
 
 async def desconectar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -909,8 +910,10 @@ async def receive_contact_card(update: Update, context: ContextTypes.DEFAULT_TYP
         return WAITING_CSV
 
     remaining = contact_limit - (campaign["total_contacts"] if campaign else 0)
-    total = await db.add_contacts(campaign_id, contacts if contact_limit <= 0 else contacts[:remaining])
-    await update.message.reply_text(f"Contato recebido. Total da campanha: {total}. Use /pronto quando terminar.")
+    selected = contacts if contact_limit <= 0 else contacts[:remaining]
+    total = await db.add_contacts(campaign_id, selected)
+    extra = "" if len(selected) == len(contacts) else f"\n{len(contacts) - len(selected)} contato(s) excederam o limite e foram ignorados."
+    await update.message.reply_text(f"Contato recebido. Total da campanha: {total}.{extra}\nUse /pronto quando terminar.")
     return WAITING_CSV
 
 
@@ -1105,7 +1108,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith(("src_", "list_", "menu_")):
-        await handle_contact_source_callback(update, context)
+        await query.answer("Esse menu expirou. Use /nova ou /listas novamente.", show_alert=True)
         return
 
     if data == "perm_yes":
@@ -1275,8 +1278,22 @@ def schedule_idle_stop(context: ContextTypes.DEFAULT_TYPE):
     if not power.enabled or settings.evolution_idle_stop_seconds <= 0:
         return
 
-    async def delayed_stop():
-        await asyncio.sleep(settings.evolution_idle_stop_seconds)
-        await power.stop_if_idle(db)
+    previous = context.application.bot_data.get("idle_stop_task")
+    if previous and not previous.done():
+        previous.cancel()
 
-    context.application.create_task(delayed_stop())
+    async def delayed_stop():
+        try:
+            await asyncio.sleep(settings.evolution_idle_stop_seconds)
+            await power.stop_if_idle(db)
+        except asyncio.CancelledError:
+            raise
+
+    task = context.application.create_task(delayed_stop())
+    context.application.bot_data["idle_stop_task"] = task
+
+    def clear(done_task):
+        if context.application.bot_data.get("idle_stop_task") is done_task:
+            context.application.bot_data.pop("idle_stop_task", None)
+
+    task.add_done_callback(clear)

@@ -8,6 +8,9 @@ from .evolution import normalize_phone
 
 PHONE_COLUMNS = ("telefone", "phone", "numero", "número", "celular", "whatsapp")
 NAME_COLUMNS = ("nome", "name", "cliente")
+MAX_ZIP_FILES = 20
+MAX_ZIP_MEMBER_BYTES = 10 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 25 * 1024 * 1024
 
 
 def parse_contacts_file(path: Path, max_contacts: int) -> list[dict]:
@@ -61,6 +64,8 @@ def parse_contacts_vcf(path: Path, max_contacts: int) -> list[dict]:
 def parse_contacts_zip(path: Path, max_contacts: int) -> list[dict]:
     contacts = []
     seen = set()
+    accepted_files = 0
+    total_uncompressed = 0
 
     with zipfile.ZipFile(path) as archive:
         for member in archive.infolist():
@@ -70,6 +75,15 @@ def parse_contacts_zip(path: Path, max_contacts: int) -> list[dict]:
             suffix = Path(member.filename).suffix.lower()
             if suffix not in (".csv", ".vcf"):
                 continue
+
+            accepted_files += 1
+            total_uncompressed += member.file_size
+            if accepted_files > MAX_ZIP_FILES:
+                raise ValueError(f"ZIP tem arquivos demais; limite atual e {MAX_ZIP_FILES} CSV/VCF.")
+            if member.file_size > MAX_ZIP_MEMBER_BYTES:
+                raise ValueError("ZIP contem arquivo CSV/VCF grande demais.")
+            if total_uncompressed > MAX_ZIP_TOTAL_BYTES:
+                raise ValueError("ZIP grande demais apos descompactar.")
 
             content = archive.read(member).decode("utf-8-sig", errors="replace")
             parsed = parse_contacts_csv_text(content) if suffix == ".csv" else parse_contacts_vcf_text(content)
