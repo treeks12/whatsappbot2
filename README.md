@@ -17,7 +17,7 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 - `/start`: mostra o menu basico.
 - `/login`: conecta o WhatsApp da vendedora via QR Code.
 - `/conexao`: mostra o estado atual da conexao WhatsApp da vendedora.
-- `/desconectar`: explica por que o bot nao usa logout automatico como desconexao.
+- `/desconectar`: tenta desconectar a sessao sem logout; se a Evolution nao suportar, desliga o container mantendo a sessao.
 - `/nova`: cria campanha no perfil de precaucao.
 - `/nova_precaucao`: cria campanha mais cuidadosa, limite padrao de 100 contatos.
 - `/nova_confianca`: cria campanha para clientes habituais/de confianca, limite padrao de 300 contatos.
@@ -105,6 +105,13 @@ Reiniciar apos alterar `.env`:
 docker compose up -d --force-recreate bot-v2
 ```
 
+Na VPS, use o compose especifico:
+
+```bash
+docker compose -f docker-compose.vps.yml logs -f bot
+docker compose -f docker-compose.vps.yml up -d --build bot
+```
+
 Smoke test da Evolution:
 
 ```powershell
@@ -174,6 +181,29 @@ MAX_MEDIA_FILE_MB=3
 ```
 
 Evite fazer deploy/build pesado do ecommerce ao mesmo tempo que uma campanha grande com imagens.
+
+## Evolution Ligada Somente Quando Precisa
+
+No deploy VPS, o bot pode controlar o container `evolution-api` pelo Docker socket:
+
+```env
+EVOLUTION_DOCKER_CONTROL=true
+EVOLUTION_DOCKER_CONTAINER=evolution-api
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+EVOLUTION_IDLE_STOP_SECONDS=600
+```
+
+Com isso, a regra fica:
+
+- Sem campanha em disparo (`running` ou `paused`): o bot pode desligar o container da Evolution.
+- `/login` e `/nova`: o bot liga a Evolution para gerar QR ou validar conexao. Se a conexao ja estiver aberta e nao houver disparo, desliga de novo.
+- QR pendente: se ninguem usar, o bot tenta desligar a Evolution depois de `EVOLUTION_IDLE_STOP_SECONDS`.
+- `/disparar`: o bot liga a Evolution e mantem ligada ate concluir, falhar ou cancelar.
+- `/desconectar`: primeiro tenta endpoint seguro de `disconnect`; se esse build da Evolution nao tiver o endpoint, desliga o container.
+
+Isso nao apaga instancia e nao faz logout. As sessoes ficam nos volumes `evolution_store`, `evolution_instances` e no banco Postgres da Evolution. O unico ponto sensivel e que montar `/var/run/docker.sock` da poder de Docker ao container do bot, entao mantenha esse projeto privado e sem comandos de usuario livre.
+
+O fluxo de QR tambem evita apagar/recriar instancia automaticamente. Se a Evolution nao devolver QR para uma instancia existente, o bot mostra erro em vez de destruir a sessao salva.
 
 ## Dados Locais
 

@@ -361,6 +361,15 @@ class Database:
             with self.connect() as conn:
                 return conn.execute("SELECT * FROM campaigns WHERE status = 'running'").fetchall()
 
+    async def count_running_or_paused_campaigns(self) -> int:
+        async with self._lock:
+            with self.connect() as conn:
+                return int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM campaigns WHERE status IN ('running', 'paused')"
+                    ).fetchone()[0]
+                )
+
     async def campaign_summary_for_vendor(self, vendor_id: int):
         async with self._lock:
             with self.connect() as conn:

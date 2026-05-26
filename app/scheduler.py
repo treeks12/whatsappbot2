@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
@@ -38,6 +38,7 @@ class CampaignScheduler:
         campaigns_dir: Optional[Path] = None,
         cleanup_campaign_files_on_finish: bool = True,
         min_free_memory_mb: int = 256,
+        evolution_power: Optional[Any] = None,
     ):
         self.db = db
         self.evolution = evolution
@@ -47,6 +48,7 @@ class CampaignScheduler:
         self.campaigns_dir = campaigns_dir
         self.cleanup_campaign_files_on_finish = cleanup_campaign_files_on_finish
         self.min_free_memory_mb = min_free_memory_mb
+        self.evolution_power = evolution_power
         self.tasks: Dict[int, asyncio.Task] = {}
         self.instance_locks: Dict[str, asyncio.Lock] = {}
 
@@ -80,6 +82,7 @@ class CampaignScheduler:
 
         await self.db.finish_campaign(campaign_id, "cancelled")
         await self._cleanup_campaign_payload(campaign_id)
+        await self._stop_evolution_if_idle()
         return True
 
     async def pause_campaign(self, campaign_id: int) -> bool:
@@ -106,17 +109,25 @@ class CampaignScheduler:
         progress = ProgressMessage(self.telegram_app, progress_chat_id or campaign["vendor_id"], progress_message_id)
 
         async with lock:
-            await self.db.start_campaign(campaign_id)
             profile = get_profile(campaign["profile_id"])
 
             await progress.update(
-                f"Campanha #{campaign_id} iniciada.\n"
+                f"Campanha #{campaign_id} iniciando.\n"
                 f"Contatos: 0/{campaign['total_contacts']}\n"
-                "Preparando primeiro envio...",
+                "Ligando conexao do WhatsApp...",
                 campaign_controls(campaign_id),
             )
 
             try:
+                await self._ensure_evolution_running()
+                await self.db.start_campaign(campaign_id)
+                await progress.update(
+                    f"Campanha #{campaign_id} iniciada.\n"
+                    f"Contatos: 0/{campaign['total_contacts']}\n"
+                    "Preparando primeiro envio...",
+                    campaign_controls(campaign_id),
+                )
+
                 while True:
                     await self._wait_for_window()
                     await self._wait_if_paused(campaign_id, progress)
@@ -197,6 +208,8 @@ class CampaignScheduler:
                 await self.db.finish_campaign(campaign_id, "failed")
                 await self._cleanup_campaign_payload(campaign_id)
                 await progress.update(f"Campanha #{campaign_id} falhou.", None)
+            finally:
+                await self._stop_evolution_if_idle()
 
     async def _send_contact(self, campaign, contact, profile):
         await self._wait_for_memory()
@@ -257,6 +270,14 @@ class CampaignScheduler:
             campaign_id,
             self.cleanup_campaign_files_on_finish,
         )
+
+    async def _ensure_evolution_running(self):
+        if self.evolution_power:
+            await self.evolution_power.ensure_running()
+
+    async def _stop_evolution_if_idle(self):
+        if self.evolution_power:
+            await self.evolution_power.stop_if_idle(self.db)
 
     async def _sleep_with_progress(self, campaign_id: int, delay: float, progress, body: str, countdown_label: str):
         remaining = max(0, int(delay))

@@ -66,6 +66,21 @@ class EvolutionClient:
     async def connect_instance(self, instance_name: str) -> Dict[str, Any]:
         return await self._request("GET", f"/instance/connect/{instance_name}")
 
+    async def disconnect_instance(self, instance_name: str) -> bool:
+        attempts = (
+            ("POST", f"/instance/disconnect/{instance_name}"),
+            ("DELETE", f"/instance/disconnect/{instance_name}"),
+            ("POST", f"/instance/disconnect", {"instanceName": instance_name}),
+            ("DELETE", f"/instance/disconnect", {"instanceName": instance_name}),
+        )
+        for method, path, *payload in attempts:
+            try:
+                await self._request(method, path, json=payload[0] if payload else None)
+                return True
+            except EvolutionError:
+                continue
+        return False
+
     async def connection_state(self, instance_name: str) -> str:
         try:
             payload = await self._request("GET", f"/instance/connectionState/{instance_name}")
@@ -89,15 +104,14 @@ class EvolutionClient:
             message = str(exc).lower()
             if "already in use" not in message and "already exists" not in message:
                 raise
-            try:
-                connect_payload = await self.connect_instance(instance_name)
-                qr = _extract_qr(connect_payload)
-                if qr:
-                    return qr
-            except EvolutionError:
-                pass
-            await self.delete_instance(instance_name)
-            create_payload = await self.create_instance(instance_name)
+            connect_payload = await self.connect_instance(instance_name)
+            qr = _extract_qr(connect_payload)
+            if qr:
+                return qr
+            raise EvolutionError(
+                f"Instancia {instance_name} ja existe, mas a Evolution nao retornou QR. "
+                "O bot nao apaga/recria instancias automaticamente para preservar a sessao."
+            )
 
         qr = _extract_qr(create_payload)
         if qr:

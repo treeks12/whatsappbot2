@@ -1,6 +1,7 @@
 import base64
 import io
 import logging
+import asyncio
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -17,6 +18,7 @@ from .config import Settings
 from .csv_utils import mime_from_name, parse_contacts_file, parse_contacts_vcf_text, usable_phone
 from .db import Database
 from .evolution import EvolutionClient
+from .evolution_power import EvolutionPowerManager
 from .profiles import get_profile
 from .scheduler import CampaignScheduler, campaign_controls, cancel_confirmation_controls
 
@@ -73,6 +75,10 @@ def services(context: ContextTypes.DEFAULT_TYPE) -> tuple[Settings, Database, Ev
     )
 
 
+def power_service(context: ContextTypes.DEFAULT_TYPE) -> EvolutionPowerManager:
+    return context.application.bot_data["power"]
+
+
 def is_authorized(settings: Settings, user_id: int) -> bool:
     return not settings.telegram_admin_ids or user_id in settings.telegram_admin_ids
 
@@ -97,7 +103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Bot v2 ativo.\n\n"
             "/login - conectar WhatsApp\n"
             "/conexao - verificar conexao do WhatsApp\n"
-            "/desconectar - informa limite seguro da Evolution\n"
+            "/desconectar - fechar conexao sem apagar sessao quando possivel\n"
             "/nova - criar campanha com precaucao\n"
             "/nova_confianca - campanha para contatos de confianca\n"
             "/nova_precaucao - campanha mais cuidadosa\n"
@@ -128,14 +134,23 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     settings, db, evolution, _ = services(context)
+    power = power_service(context)
     user = update.effective_user
     instance_name = f"vendor_{user.id}"
     await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
 
     await update.message.reply_text("Preparando conexao do WhatsApp...")
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao ligar Evolution")
+        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
+        return
+
     state = await evolution.connection_state(instance_name)
     if state == "open":
         await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
+        await power.stop_if_idle(db)
         return
 
     try:
@@ -150,6 +165,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo=io.BytesIO(image),
         caption="Escaneie em WhatsApp > Aparelhos conectados > Conectar aparelho.",
     )
+    schedule_idle_stop(context)
 
 
 async def conexao(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,9 +173,19 @@ async def conexao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _, db, evolution, _ = services(context)
+    power = power_service(context)
     user = update.effective_user
     instance_name = f"vendor_{user.id}"
     await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
+    if power.enabled and await power.container_state() != "running":
+        await update.message.reply_text("Evolution API: desligada. WhatsApp: sem socket ativo.")
+        return
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao verificar Evolution")
+        await update.message.reply_text(f"Erro ao verificar Evolution: {exc}")
+        return
     state = await evolution.connection_state(instance_name)
     await update.message.reply_text(f"Conexao WhatsApp: {state}.")
 
@@ -168,9 +194,40 @@ async def desconectar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update, context):
         return
 
+    _, db, evolution, _ = services(context)
+    power = power_service(context)
+    user = update.effective_user
+    instance_name = f"vendor_{user.id}"
+    await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
+
+    if await db.count_running_or_paused_campaigns() > 0:
+        await update.message.reply_text("Existe campanha rodando/pausada. Cancele ou conclua antes de desconectar.")
+        return
+
+    if power.enabled and await power.container_state() != "running":
+        await update.message.reply_text("Evolution API ja esta desligada. Sessao preservada.")
+        return
+
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao ligar Evolution")
+        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
+        return
+    if await evolution.disconnect_instance(instance_name):
+        await update.message.reply_text("Disconnect enviado para esta sessao. Sessao preservada.")
+        return
+
+    if power.enabled:
+        await power.stop_container()
+        await update.message.reply_text(
+            "A Evolution deste build nao aceitou disconnect por sessao. "
+            "Desliguei o container como fallback, preservando a sessao."
+        )
+        return
+
     await update.message.reply_text(
-        "A Evolution 2.4 nesta instalacao nao expoe um endpoint seguro para apenas fechar o socket mantendo a sessao.\n"
-        "O endpoint disponivel e logout, que pode exigir QR novamente. Por isso o bot nao desconecta automaticamente."
+        "A Evolution deste build nao aceitou disconnect por sessao e controle de container nao esta configurado."
     )
 
 
@@ -179,6 +236,7 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     settings, db, evolution, _ = services(context)
+    power = power_service(context)
     user = update.effective_user
     instance_name = f"vendor_{user.id}"
     await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
@@ -189,6 +247,13 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Voce ja tem uma campanha ativa #{active['id']} ({active['status']}). "
             "Use /cancelar para descartar ou /disparar se ela estiver pronta."
         )
+        return ConversationHandler.END
+
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao ligar Evolution")
+        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
         return ConversationHandler.END
 
     state = await evolution.connection_state(instance_name)
@@ -208,6 +273,7 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text("Conexao ainda nao abriu. Rode /conexao para verificar.")
+        schedule_idle_stop(context)
         return ConversationHandler.END
 
     profile_id = profile_from_command(update, settings.default_profile)
@@ -224,6 +290,7 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Limite: {contact_limit} contatos.\n"
         "Se o Telegram transformar em cartoes de contato, use /pronto quando terminar."
     )
+    await power.stop_if_idle(db)
     return WAITING_CSV
 
 
@@ -658,3 +725,16 @@ async def perm_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:
     return settings.campaigns_dir / str(campaign_id)
+
+
+def schedule_idle_stop(context: ContextTypes.DEFAULT_TYPE):
+    settings, db, _, _ = services(context)
+    power = power_service(context)
+    if not power.enabled or settings.evolution_idle_stop_seconds <= 0:
+        return
+
+    async def delayed_stop():
+        await asyncio.sleep(settings.evolution_idle_stop_seconds)
+        await power.stop_if_idle(db)
+
+    context.application.create_task(delayed_stop())

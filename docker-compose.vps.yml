@@ -99,10 +99,15 @@ services:
       - DEFAULT_PROFILE=${DEFAULT_PROFILE:-precaucao_100}
       - SEND_WINDOW=${SEND_WINDOW:-}
       - MIN_FREE_MEMORY_MB=${MIN_FREE_MEMORY_MB:-256}
+      - EVOLUTION_DOCKER_CONTROL=true
+      - EVOLUTION_DOCKER_CONTAINER=evolution-api
+      - DOCKER_SOCKET_PATH=/var/run/docker.sock
+      - EVOLUTION_IDLE_STOP_SECONDS=${EVOLUTION_IDLE_STOP_SECONDS:-600}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data
       - ./campaigns:/app/campaigns
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - evolution-api
     networks:

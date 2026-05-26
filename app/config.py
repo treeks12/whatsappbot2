@@ -47,6 +47,10 @@ class Settings:
     default_profile: str
     send_window: Optional[str]
     min_free_memory_mb: int
+    evolution_docker_control: bool
+    evolution_docker_container: str
+    docker_socket_path: str
+    evolution_idle_stop_seconds: int
 
 
 def load_settings() -> Settings:
@@ -68,4 +72,8 @@ def load_settings() -> Settings:
         default_profile=os.getenv("DEFAULT_PROFILE", "humano_100"),
         send_window=os.getenv("SEND_WINDOW") or None,
         min_free_memory_mb=_int_env("MIN_FREE_MEMORY_MB", 256),
+        evolution_docker_control=_bool_env("EVOLUTION_DOCKER_CONTROL", False),
+        evolution_docker_container=os.getenv("EVOLUTION_DOCKER_CONTAINER", "evolution-api"),
+        docker_socket_path=os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock"),
+        evolution_idle_stop_seconds=_int_env("EVOLUTION_IDLE_STOP_SECONDS", 600),
     )
