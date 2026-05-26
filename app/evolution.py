@@ -57,12 +57,6 @@ class EvolutionClient:
             "instanceName": instance_name,
             "qrcode": True,
             "integration": "WHATSAPP-BAILEYS",
-            "rejectCall": True,
-            "groupsIgnore": True,
-            "alwaysOnline": False,
-            "readMessages": False,
-            "readStatus": False,
-            "syncFullHistory": False,
         }
         return await self._request("POST", "/instance/create", json=payload)
 
