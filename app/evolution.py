@@ -95,15 +95,14 @@ class EvolutionClient:
         try:
             create_payload = await self.create_instance(instance_name)
         except EvolutionError as exc:
-            message = str(exc).lower()
-            if "already in use" not in message and "already exists" not in message:
+            if not _is_existing_instance_error(exc):
                 raise
-            connect_payload = await self.connect_instance(instance_name)
-            qr = _extract_qr(connect_payload)
-            if qr:
+            qr = await self._wait_existing_instance(instance_name)
+            if qr is not None:
                 return qr
             raise EvolutionError(
                 f"Instancia {instance_name} ja existe, mas a Evolution nao retornou QR. "
+                "Ela pode estar em inicializacao ou presa em um estado antigo. "
                 "O bot nao apaga/recria instancias automaticamente para preservar a sessao."
             )
 
@@ -116,6 +115,38 @@ class EvolutionClient:
         if not qr:
             raise EvolutionError(f"QR Code not returned for {instance_name}: {connect_payload}")
         return qr
+
+    async def _wait_existing_instance(self, instance_name: str, timeout_seconds: int = 45) -> Optional[str]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_payload = None
+        while asyncio.get_running_loop().time() < deadline:
+            state = await self.connection_state(instance_name)
+            if state == "open":
+                return ""
+
+            try:
+                connect_payload = await self.connect_instance(instance_name)
+            except EvolutionError as exc:
+                last_payload = str(exc)
+                await asyncio.sleep(2)
+                continue
+
+            last_payload = connect_payload
+            qr = _extract_qr(connect_payload)
+            if qr:
+                return qr
+
+            nested_state = (
+                connect_payload.get("instance", {}).get("state")
+                or connect_payload.get("state")
+                or connect_payload.get("connectionStatus")
+            )
+            if nested_state == "open":
+                return ""
+
+            await asyncio.sleep(2)
+
+        return None
 
     async def send_text(self, instance_name: str, phone: str, text: str):
         return await self._request(
@@ -189,3 +220,8 @@ def _extract_qr(payload: Dict[str, Any]) -> str:
         if isinstance(nested, str):
             return nested.split(",", 1)[-1] if nested.startswith("data:image") else nested
     return ""
+
+
+def _is_existing_instance_error(exc: EvolutionError) -> bool:
+    message = str(exc).lower()
+    return "already in use" in message or "already exists" in message
