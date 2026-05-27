@@ -100,6 +100,7 @@ def register_handlers(application):
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(CommandHandler("cancelar", cancelar))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, perm_receive_name))
+    application.add_error_handler(error_handler)
 
 
 def services(context: ContextTypes.DEFAULT_TYPE) -> tuple[Settings, Database, EvolutionClient, CampaignScheduler]:
@@ -197,7 +198,18 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Erro ao gerar QR: {exc}")
         return
 
-    image = base64.b64decode(qr_base64)
+    image = qr_photo_bytes(qr_base64)
+    if not image:
+        state = await evolution.connection_state(instance_name)
+        if state == "open":
+            await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
+        else:
+            await update.message.reply_text(
+                f"Evolution respondeu sem QR e a conexao esta em '{state}'. Tente /login novamente em alguns segundos."
+            )
+        schedule_idle_stop(context)
+        return
+
     await update.message.reply_photo(
         photo=io.BytesIO(image),
         caption="Escaneie em WhatsApp > Aparelhos conectados > Conectar aparelho.",
@@ -303,14 +315,23 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Erro ao gerar QR")
             await update.message.reply_text(f"Erro ao gerar QR: {exc}")
             return ConversationHandler.END
-        if qr_base64:
-            image = base64.b64decode(qr_base64)
+        image = qr_photo_bytes(qr_base64)
+        if image:
             await update.message.reply_photo(
                 photo=io.BytesIO(image),
                 caption="Escaneie o QR e rode /nova novamente quando a conexao estiver aberta.",
             )
+            schedule_idle_stop(context)
+            return ConversationHandler.END
+        state = await evolution.connection_state(instance_name)
+        if state == "open":
+            profile_id = profile_from_command(update, settings.default_profile)
+            context.user_data["pending_campaign_profile_id"] = profile_id
+            await show_campaign_contact_source(update.message, db, user.id, profile_id)
+            await power.stop_if_idle(db)
+            return WAITING_CONTACT_SOURCE
         else:
-            await update.message.reply_text("Conexao ainda nao abriu. Rode /conexao para verificar.")
+            await update.message.reply_text(f"Conexao ainda nao abriu. Estado atual: {state}. Rode /conexao para verificar.")
         schedule_idle_stop(context)
         return ConversationHandler.END
 
@@ -1268,8 +1289,31 @@ async def perm_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Permissão requisitada. Aguarde a aprovação.")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    exc_info = None
+    if context.error:
+        exc_info = (type(context.error), context.error, context.error.__traceback__)
+    logger.error("Erro inesperado no handler do Telegram", exc_info=exc_info)
+    message = getattr(update, "effective_message", None)
+    if message:
+        try:
+            await message.reply_text("Erro interno no bot. Tente o comando novamente.")
+        except Exception:
+            pass
+
+
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:
     return settings.campaigns_dir / str(campaign_id)
+
+
+def qr_photo_bytes(qr_base64: str) -> bytes | None:
+    if not qr_base64:
+        return None
+    try:
+        image = base64.b64decode(qr_base64, validate=True)
+    except Exception:
+        return None
+    return image or None
 
 
 def schedule_idle_stop(context: ContextTypes.DEFAULT_TYPE):
