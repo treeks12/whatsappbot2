@@ -153,7 +153,7 @@ class EvolutionClient:
                 return True
             try:
                 payload = await self.connect_instance(instance_name)
-            except EvolutionError:
+            except Exception:
                 await asyncio.sleep(2)
                 continue
             nested_state = (
