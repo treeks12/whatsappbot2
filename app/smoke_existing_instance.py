@@ -47,6 +47,17 @@ async def main():
     assert qr.connect_calls == 1
     print("existing.qr_after_connect.ok")
 
+    ready = ExistingInstanceClient(
+        states=["close", "connecting", "open"],
+        connect_payloads=[
+            {"instance": {"state": "connecting"}},
+            {"instance": {"state": "open"}},
+        ],
+    )
+    assert await ready.wait_until_open("vendor_test", timeout_seconds=5)
+    assert ready.connect_calls == 2
+    print("existing.wait_until_open.ok")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

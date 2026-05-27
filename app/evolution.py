@@ -118,7 +118,6 @@ class EvolutionClient:
 
     async def _wait_existing_instance(self, instance_name: str, timeout_seconds: int = 45) -> Optional[str]:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
-        last_payload = None
         while asyncio.get_running_loop().time() < deadline:
             state = await self.connection_state(instance_name)
             if state == "open":
@@ -127,11 +126,9 @@ class EvolutionClient:
             try:
                 connect_payload = await self.connect_instance(instance_name)
             except EvolutionError as exc:
-                last_payload = str(exc)
                 await asyncio.sleep(2)
                 continue
 
-            last_payload = connect_payload
             qr = _extract_qr(connect_payload)
             if qr:
                 return qr
@@ -147,6 +144,27 @@ class EvolutionClient:
             await asyncio.sleep(2)
 
         return None
+
+    async def wait_until_open(self, instance_name: str, timeout_seconds: int = 75) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            state = await self.connection_state(instance_name)
+            if state == "open":
+                return True
+            try:
+                payload = await self.connect_instance(instance_name)
+            except EvolutionError:
+                await asyncio.sleep(2)
+                continue
+            nested_state = (
+                payload.get("instance", {}).get("state")
+                or payload.get("state")
+                or payload.get("connectionStatus")
+            )
+            if nested_state == "open":
+                return True
+            await asyncio.sleep(2)
+        return False
 
     async def send_text(self, instance_name: str, phone: str, text: str):
         return await self._request(

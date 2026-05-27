@@ -189,7 +189,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = await evolution.connection_state(instance_name)
     if state == "open":
         await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
-        await power.stop_if_idle(db)
+        schedule_idle_stop(context)
         return
 
     try:
@@ -339,7 +339,7 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_id = profile_from_command(update, settings.default_profile)
     context.user_data["pending_campaign_profile_id"] = profile_id
     await show_campaign_contact_source(update.message, db, user.id, profile_id)
-    await power.stop_if_idle(db)
+    schedule_idle_stop(context)
     return WAITING_CONTACT_SOURCE
 
 
@@ -1093,9 +1093,11 @@ async def disparar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state = await evolution.connection_state(campaign_with_vendor["instance_name"])
     if state != "open":
-        await update.message.reply_text("WhatsApp nao esta conectado. Use /login antes de disparar.")
-        await power.stop_if_idle(db)
-        return
+        status_message = await update.message.reply_text("Aguardando conexao do WhatsApp abrir...")
+        if not await evolution.wait_until_open(campaign_with_vendor["instance_name"]):
+            await status_message.edit_text("WhatsApp nao esta conectado. Use /login antes de disparar.")
+            await power.stop_if_idle(db)
+            return
 
     progress_message = await update.message.reply_text("Preparando campanha...")
     ok = await scheduler.start(campaign["id"], update.effective_chat.id, progress_message.message_id)
