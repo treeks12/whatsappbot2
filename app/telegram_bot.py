@@ -406,6 +406,7 @@ async def show_lists_menu(message, db: Database, vendor_id: int, *, edit: bool =
             )
         ])
     keyboard.append([InlineKeyboardButton("Criar nova lista", callback_data="list_new")])
+    keyboard.append([InlineKeyboardButton("Sair", callback_data="list_exit")])
     text = "Suas listas:" if rows else "Voce ainda nao tem listas salvas."
     if len(rows) > 8:
         text += f"\nMostrando 8 de {len(rows)} listas."
@@ -469,6 +470,7 @@ async def show_contact_list_detail(query, db: Database, vendor_id: int, list_id:
             [InlineKeyboardButton("Backups", callback_data=f"list_backups:{list_id}")],
             [InlineKeyboardButton("Apagar", callback_data=f"list_delete_ask:{list_id}")],
             [InlineKeyboardButton("Voltar", callback_data="list_menu")],
+            [InlineKeyboardButton("Sair", callback_data="list_exit")],
         ]),
     )
 
@@ -482,6 +484,13 @@ async def handle_contact_source_callback(update: Update, context: ContextTypes.D
     settings, db, _, _ = services(context)
     vendor_id = query.from_user.id
     data = query.data or ""
+
+    if data == "list_exit":
+        context.user_data.pop("active_list_id", None)
+        context.user_data.pop("list_flow", None)
+        context.user_data.pop("remove_phones", None)
+        await query.edit_message_text("Menu fechado.")
+        return ConversationHandler.END
 
     if data == "src_back":
         profile_id = context.user_data.get("pending_campaign_profile_id", settings.default_profile)
@@ -592,6 +601,7 @@ async def handle_contact_source_callback(update: Update, context: ContextTypes.D
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Confirmar apagar", callback_data=f"list_delete_yes:{list_id}")],
                 [InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")],
+                [InlineKeyboardButton("Sair", callback_data="list_exit")],
             ]),
         )
         return WAITING_CONTACT_SOURCE
@@ -807,7 +817,10 @@ async def show_list_backups(query, db: Database, vendor_id: int, list_id: int):
     if not rows:
         await query.edit_message_text(
             "Nenhum backup disponivel.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")]]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")],
+                [InlineKeyboardButton("Sair", callback_data="list_exit")],
+            ]),
         )
         return
     keyboard = [
@@ -820,6 +833,7 @@ async def show_list_backups(query, db: Database, vendor_id: int, list_id: int):
         for row in rows[:5]
     ]
     keyboard.append([InlineKeyboardButton("Voltar", callback_data=f"list_open:{list_id}")])
+    keyboard.append([InlineKeyboardButton("Sair", callback_data="list_exit")])
     await query.edit_message_text("Backups disponiveis:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
