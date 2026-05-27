@@ -78,7 +78,7 @@ class EvolutionClient:
     async def connection_state(self, instance_name: str) -> str:
         try:
             payload = await self._request("GET", f"/instance/connectionState/{instance_name}")
-        except EvolutionError:
+        except Exception:
             return "close"
 
         state = payload.get("instance", {}).get("state") or payload.get("state") or payload.get("connectionStatus")
