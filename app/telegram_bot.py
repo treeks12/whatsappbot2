@@ -7,6 +7,7 @@ import warnings
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     CallbackQueryHandler,
@@ -1204,7 +1205,8 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
         ok = await scheduler.pause_campaign(campaign_id)
         await query.answer("Campanha pausada." if ok else "Nao foi possivel pausar.")
         if ok:
-            await query.edit_message_text(
+            await safe_edit_query_text(
+                query,
                 f"Campanha #{campaign_id} pausada.\nUse Retomar para continuar.",
                 reply_markup=campaign_controls(campaign_id, paused=True),
             )
@@ -1214,7 +1216,8 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
         ok = await scheduler.resume_campaign(campaign_id)
         await query.answer("Campanha retomada." if ok else "Nao foi possivel retomar.")
         if ok:
-            await query.edit_message_text(
+            await safe_edit_query_text(
+                query,
                 f"Campanha #{campaign_id} retomada.\nAguardando proximo envio...",
                 reply_markup=campaign_controls(campaign_id),
             )
@@ -1223,7 +1226,8 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     if action == "campaign_cancel_ask":
         paused = campaign["status"] == "paused"
         await query.answer()
-        await query.edit_message_text(
+        await safe_edit_query_text(
+            query,
             f"Cancelar campanha #{campaign_id}?\nEssa acao nao envia mais contatos.",
             reply_markup=cancel_confirmation_controls(campaign_id, paused=paused),
         )
@@ -1231,7 +1235,8 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "campaign_cancel_no":
         await query.answer("Cancelamento descartado.")
-        await query.edit_message_text(
+        await safe_edit_query_text(
+            query,
             f"Campanha #{campaign_id} continua em andamento.",
             reply_markup=campaign_controls(campaign_id),
         )
@@ -1239,7 +1244,8 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "campaign_cancel_no_paused":
         await query.answer("Cancelamento descartado.")
-        await query.edit_message_text(
+        await safe_edit_query_text(
+            query,
             f"Campanha #{campaign_id} continua pausada.",
             reply_markup=campaign_controls(campaign_id, paused=True),
         )
@@ -1248,7 +1254,8 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     if action == "campaign_cancel_yes":
         ok = await scheduler.cancel_campaign(campaign_id)
         await query.answer("Campanha cancelada." if ok else "Nao foi possivel cancelar.")
-        await query.edit_message_text(
+        await safe_edit_query_text(
+            query,
             f"Campanha #{campaign_id} cancelada." if ok else f"Campanha #{campaign_id} nao estava ativa."
         )
         return
@@ -1300,6 +1307,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Erro interno no bot. Tente o comando novamente.")
         except Exception:
             pass
+
+
+async def safe_edit_query_text(query, text: str, reply_markup=None):
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "Message is not modified" in str(exc):
+            return
+        raise
 
 
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:
