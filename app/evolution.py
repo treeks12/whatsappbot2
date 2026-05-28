@@ -305,6 +305,13 @@ class EvolutionClient:
             json={"number": normalize_phone(phone), "text": text},
         )
 
+    async def send_presence(self, instance_name: str, phone: str, presence: str = "composing", delay: int = 1500):
+        return await self._request(
+            "POST",
+            f"/chat/sendPresence/{instance_name}",
+            json={"number": normalize_phone(phone), "presence": presence, "delay": delay},
+        )
+
     async def send_media(
         self,
         instance_name: str,

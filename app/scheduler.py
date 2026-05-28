@@ -1,5 +1,12 @@
 import asyncio
+import base64
 import logging
+import random
+import re
+import secrets
+import struct
+import uuid
+import zlib
 from datetime import datetime, time
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -9,11 +16,17 @@ from telegram.ext import Application
 
 from .cleanup import cleanup_campaign_payload
 from .db import Database
-from .evolution import EvolutionClient, EvolutionError, file_to_base64
+from .evolution import EvolutionClient, EvolutionError
 from .profiles import get_profile
 
 
 logger = logging.getLogger(__name__)
+
+
+SPINTAX_RE = re.compile(r"\{([^{}|]+(?:\|[^{}|]+)+)\}")
+PRESENCE_MS_PER_CHAR = 40
+PRESENCE_MIN_DELAY_MS = 1500
+PRESENCE_MAX_DELAY_MS = 8000
 
 
 # --- Shadowban / restricao auto-pause -----------------------------------------
@@ -188,7 +201,7 @@ class CampaignScheduler:
                 await self._ensure_connection_open(instance_name)
                 await self.db.start_campaign(campaign_id)
                 media_items = await self.db.get_media(campaign_id)
-                media_cache: Dict[str, str] = {}
+                media_cache: Dict[str, bytes] = {}
                 await progress.update(
                     f"Campanha #{campaign_id} iniciada.\n"
                     f"Contatos: 0/{campaign['total_contacts']}\n"
@@ -308,23 +321,31 @@ class CampaignScheduler:
             finally:
                 await self._stop_evolution_if_idle()
 
-    async def _send_contact(self, campaign, contact, profile, media_items, media_cache: Dict[str, str]):
+    async def _send_contact(self, campaign, contact, profile, media_items, media_cache: Dict[str, bytes]):
         await self._wait_for_memory()
-        text = (campaign["caption"] or "").replace("{nome}", contact["name"] or "Cliente")
+        text = render_caption(
+            campaign["caption"] or "",
+            contact["name"] or "Cliente",
+        )
 
         for index, media in enumerate(media_items):
             is_last_media = index == len(media_items) - 1
             await self._wait_for_memory()
-            media_base64 = media_cache.get(media["path"])
-            if media_base64 is None:
-                media_base64 = await file_to_base64(media["path"])
-                media_cache[media["path"]] = media_base64
+            raw_media = media_cache.get(media["path"])
+            if raw_media is None:
+                raw_media = await read_media_bytes(media["path"])
+                media_cache[media["path"]] = raw_media
+            outbound_media = mutate_media_bytes(raw_media, media["mime_type"])
+            media_base64 = base64.b64encode(outbound_media).decode("ascii")
+            file_name = random_media_file_name(media["file_name"], media["mime_type"])
+            if text and is_last_media:
+                await self._send_typing_presence(campaign["instance_name"], contact["phone"], text)
             await self.evolution.send_media(
                 campaign["instance_name"],
                 contact["phone"],
                 media["path"],
                 media["mime_type"],
-                media["file_name"],
+                file_name,
                 text if is_last_media else "",
                 media_base64,
             )
@@ -333,7 +354,15 @@ class CampaignScheduler:
 
         if text and not media_items:
             await asyncio.sleep(profile.before_text())
+            await self._send_typing_presence(campaign["instance_name"], contact["phone"], text)
             await self.evolution.send_text(campaign["instance_name"], contact["phone"], text)
+
+    async def _send_typing_presence(self, instance_name: str, phone: str, text: str):
+        delay = typing_delay_ms(text)
+        try:
+            await self.evolution.send_presence(instance_name, phone, "composing", delay)
+        except EvolutionError:
+            logger.warning("Evolution nao aceitou sendPresence para %s", phone, exc_info=True)
 
     async def _wait_for_window(self):
         if not self.send_window:
@@ -447,6 +476,70 @@ def is_inside_window(window) -> bool:
     if start <= end:
         return start <= now <= end
     return now >= start or now <= end
+
+
+def render_caption(template: str, contact_name: str) -> str:
+    def replace_spintax(match):
+        options = [option.strip() for option in match.group(1).split("|")]
+        options = [option for option in options if option]
+        return random.choice(options) if options else match.group(0)
+
+    spun = SPINTAX_RE.sub(replace_spintax, template)
+    return spun.replace("{nome}", contact_name)
+
+
+def typing_delay_ms(text: str) -> int:
+    delay = len(text) * PRESENCE_MS_PER_CHAR
+    return max(PRESENCE_MIN_DELAY_MS, min(PRESENCE_MAX_DELAY_MS, delay))
+
+
+async def read_media_bytes(path: str) -> bytes:
+    return await asyncio.to_thread(Path(path).read_bytes)
+
+
+def mutate_media_bytes(raw: bytes, mime_type: str) -> bytes:
+    mime = (mime_type or "").lower()
+    if "jpeg" in mime or "jpg" in mime or raw.startswith(b"\xff\xd8"):
+        return mutate_jpeg_comment(raw)
+    if "png" in mime or raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return mutate_png_text_chunk(raw)
+    return raw
+
+
+def mutate_jpeg_comment(raw: bytes) -> bytes:
+    if len(raw) < 4 or raw[-2:] != b"\xff\xd9":
+        return raw
+    comment = secrets.token_bytes(random.randint(8, 24))
+    length = struct.pack(">H", len(comment) + 2)
+    return raw[:-2] + b"\xff\xfe" + length + comment + b"\xff\xd9"
+
+
+def mutate_png_text_chunk(raw: bytes) -> bytes:
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw
+    iend_type_pos = raw.rfind(b"IEND")
+    if iend_type_pos < 4:
+        return raw
+    iend_chunk_pos = iend_type_pos - 4
+    chunk_type = b"tEXt"
+    chunk_data = b"variant\x00" + secrets.token_hex(8).encode("ascii")
+    length = struct.pack(">I", len(chunk_data))
+    crc = struct.pack(">I", zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF)
+    chunk = length + chunk_type + chunk_data + crc
+    return raw[:iend_chunk_pos] + chunk + raw[iend_chunk_pos:]
+
+
+def random_media_file_name(original_name: str, mime_type: str) -> str:
+    suffix = Path(original_name or "").suffix.lower()
+    if not suffix:
+        mime = (mime_type or "").lower()
+        if "png" in mime:
+            suffix = ".png"
+        elif "webp" in mime:
+            suffix = ".webp"
+        else:
+            suffix = ".jpg"
+    return f"{uuid.uuid4().hex[:12]}{suffix}"
 
 
 class ProgressMessage:
