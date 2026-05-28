@@ -8,7 +8,66 @@ import aiohttp
 
 
 class EvolutionError(RuntimeError):
-    pass
+    """Erro vindo da Evolution API.
+
+    Atributo `category` permite que o chamador (scheduler) decida o quao
+    suspeito esse erro e, sem precisar reparsear a string toda vez:
+
+    - "shadowban":     mensagens classicas de shadowban / mensagem rejeitada pelo WhatsApp
+    - "not_authorized": 401/403, "blocked", "forbidden", "not authorized"
+    - "rate_limit":    429 ou texto sugerindo rate limit
+    - "connection":    "connection closed", "connection lost", erros de socket
+    - "generic":       qualquer outro erro
+    """
+
+    def __init__(self, message: str, *, category: str = "generic"):
+        super().__init__(message)
+        self.category = category
+
+
+def _classify_evolution_error(status: int, payload) -> str:
+    text = ""
+    if isinstance(payload, dict):
+        for key in ("message", "error", "raw", "response"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                text = value
+                break
+            if isinstance(value, list) and value and isinstance(value[0], str):
+                text = value[0]
+                break
+            if isinstance(value, dict):
+                inner = value.get("message") or value.get("error")
+                if isinstance(inner, str):
+                    text = inner
+                    break
+    elif isinstance(payload, str):
+        text = payload
+
+    text_low = text.lower() if text else ""
+
+    # Strings classicas do Baileys/WhatsApp Web associadas a shadowban.
+    if (
+        "shadow ban" in text_low
+        or "shadowban" in text_low
+        or "rejected sending" in text_low
+        or "whatsapp rejected" in text_low
+    ):
+        return "shadowban"
+    if status == 429 or "rate limit" in text_low or "too many" in text_low:
+        return "rate_limit"
+    if status in (401, 403):
+        return "not_authorized"
+    if (
+        "not authorized" in text_low
+        or "forbidden" in text_low
+        or "blocked" in text_low
+        or "unauthorized" in text_low
+    ):
+        return "not_authorized"
+    if "connection closed" in text_low or "connection lost" in text_low or "socket" in text_low:
+        return "connection"
+    return "generic"
 
 
 class EvolutionClient:
@@ -48,7 +107,11 @@ class EvolutionClient:
                 payload = {"raw": await response.text()}
 
             if response.status >= 400:
-                raise EvolutionError(f"{method} {path} failed: {response.status} {payload}")
+                category = _classify_evolution_error(response.status, payload)
+                raise EvolutionError(
+                    f"{method} {path} failed: {response.status} {payload}",
+                    category=category,
+                )
 
             return payload
 
@@ -86,6 +149,75 @@ class EvolutionClient:
 
     async def license_status(self) -> Dict[str, Any]:
         return await self._request("GET", "/license/status")
+
+    async def whatsapp_numbers(self, instance_name: str, numbers: list) -> list:
+        """Verifica se cada numero existe no WhatsApp.
+
+        Retorna lista de dicts: [{"exists": bool, "jid": str, "number": str}, ...]
+        Pode incluir tanto JIDs `<digits>@s.whatsapp.net` quanto `<lid>@lid`.
+        """
+        clean = [n for n in (numbers or []) if n]
+        if not clean:
+            return []
+        payload = await self._request(
+            "POST",
+            f"/chat/whatsappNumbers/{instance_name}",
+            json={"numbers": clean},
+        )
+        if isinstance(payload, list):
+            return payload
+        # Algumas versoes encapsulam em {"data": [...]} ou similar.
+        if isinstance(payload, dict):
+            for key in ("data", "results", "numbers"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value
+        raise EvolutionError(f"Unexpected whatsappNumbers response: {payload}")
+
+    async def set_instance_webhook(
+        self,
+        instance_name: str,
+        url: str,
+        events: Optional[list] = None,
+        webhook_by_events: bool = True,
+    ) -> Dict[str, Any]:
+        """Configura o webhook da instancia.
+
+        Quando webhook_by_events=True, a Evolution acrescenta /messages-upsert,
+        /messages-update, /connection-update etc. ao final da URL.
+        """
+        events = events or [
+            "MESSAGES_UPSERT",
+            "MESSAGES_UPDATE",
+            "CONNECTION_UPDATE",
+            "SEND_MESSAGE",
+        ]
+        payload = {
+            "enabled": True,
+            "url": url,
+            "webhookByEvents": webhook_by_events,
+            "webhookBase64": False,
+            "events": events,
+        }
+        # Algumas versoes esperam o objeto encapsulado em "webhook"; tentamos a forma flat
+        # primeiro (que e a documentada) e caimos para a aninhada se vier 4xx.
+        try:
+            return await self._request("POST", f"/webhook/set/{instance_name}", json=payload)
+        except EvolutionError as exc:
+            message = str(exc).lower()
+            if "400" in message or "validation" in message or "schema" in message:
+                return await self._request(
+                    "POST",
+                    f"/webhook/set/{instance_name}",
+                    json={"webhook": payload},
+                )
+            raise
+
+    async def find_instance_webhook(self, instance_name: str) -> Dict[str, Any]:
+        try:
+            return await self._request("GET", f"/webhook/find/{instance_name}")
+        except EvolutionError:
+            return {}
 
     async def ensure_fresh_qr(self, instance_name: str) -> str:
         state = await self.connection_state(instance_name)

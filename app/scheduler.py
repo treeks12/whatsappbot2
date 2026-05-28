@@ -9,11 +9,60 @@ from telegram.ext import Application
 
 from .cleanup import cleanup_campaign_payload
 from .db import Database
-from .evolution import EvolutionClient, file_to_base64
+from .evolution import EvolutionClient, EvolutionError, file_to_base64
 from .profiles import get_profile
 
 
 logger = logging.getLogger(__name__)
+
+
+# --- Shadowban / restricao auto-pause -----------------------------------------
+
+# Quando o score de suspeita atinge esse valor, a campanha pausa sozinha.
+SUSPICION_LIMIT = 5
+# Bumps por categoria de evento.
+SUSPICION_BUMP = {
+    "shadowban": 3,
+    "not_authorized": 3,
+    "rate_limit": 2,
+    "connection": 1,
+    "generic": 1,
+    "connection_close_event": 1,  # vindo do webhook
+}
+# Decay aplicado por envio bem-sucedido.
+SUSPICION_DECAY_ON_OK = 1
+
+
+class SuspicionTracker:
+    """Score por instancia (vendor_<id>) usado pra detectar shadowban precoce.
+
+    Compartilhado entre `CampaignScheduler` (que faz bump em erros e decay em
+    sucessos) e `WebhookServer` (que faz bump quando recebe `connection.update`
+    com state=close).
+    """
+
+    def __init__(self):
+        self._scores: Dict[str, int] = {}
+
+    def get(self, instance_name: str) -> int:
+        return self._scores.get(instance_name, 0)
+
+    def bump(self, instance_name: str, category: str) -> int:
+        amount = SUSPICION_BUMP.get(category, 1)
+        new = self._scores.get(instance_name, 0) + amount
+        self._scores[instance_name] = new
+        return new
+
+    def decay(self, instance_name: str, amount: int = SUSPICION_DECAY_ON_OK) -> int:
+        new = max(0, self._scores.get(instance_name, 0) - amount)
+        if new == 0:
+            self._scores.pop(instance_name, None)
+        else:
+            self._scores[instance_name] = new
+        return new
+
+    def reset(self, instance_name: str):
+        self._scores.pop(instance_name, None)
 
 
 class CampaignConnectionLost(RuntimeError):
@@ -43,6 +92,7 @@ class CampaignScheduler:
         cleanup_campaign_files_on_finish: bool = True,
         min_free_memory_mb: int = 256,
         evolution_power: Optional[Any] = None,
+        suspicion_tracker: Optional[SuspicionTracker] = None,
     ):
         self.db = db
         self.evolution = evolution
@@ -53,6 +103,7 @@ class CampaignScheduler:
         self.cleanup_campaign_files_on_finish = cleanup_campaign_files_on_finish
         self.min_free_memory_mb = min_free_memory_mb
         self.evolution_power = evolution_power
+        self.suspicion = suspicion_tracker or SuspicionTracker()
         self.tasks: Dict[int, asyncio.Task] = {}
         self.instance_locks: Dict[str, asyncio.Lock] = {}
 
@@ -106,6 +157,10 @@ class CampaignScheduler:
         if not campaign or campaign["status"] != "paused":
             return False
         await self.db.set_campaign_status(campaign_id, "running")
+        # Da fresh start ao tracker. Se o problema voltar, o auto-pause volta.
+        campaign_with_vendor = await self.db.get_campaign_with_vendor(campaign_id)
+        if campaign_with_vendor:
+            self.suspicion.reset(campaign_with_vendor["instance_name"])
         return True
 
     async def _run_campaign(self, campaign_id: int, progress_chat_id: Optional[int], progress_message_id: Optional[int]):
@@ -119,6 +174,7 @@ class CampaignScheduler:
 
         async with lock:
             profile = get_profile(campaign["profile_id"])
+            self.suspicion.reset(instance_name)
 
             await progress.update(
                 f"Campanha #{campaign_id} iniciando.\n"
@@ -172,20 +228,37 @@ class CampaignScheduler:
                     )
 
                     try:
+                        try:
+                            await self.db.record_send_attempt(campaign["vendor_id"], contact["phone"])
+                        except Exception:
+                            logger.warning("Falha ao registrar tentativa para %s", contact["id"], exc_info=True)
                         await self._send_contact(campaign, contact, profile, media_items, media_cache)
                         await self.db.mark_contact_sent(campaign_id, contact["id"], contact["phone"])
+                        self.suspicion.decay(instance_name)
                         result_line = f"Contato {current_number}/{total} enviado."
                     except Exception as exc:
                         if await self._connection_closed(instance_name):
                             raise CampaignConnectionLost("WhatsApp desconectou durante a campanha.") from exc
-                        logger.exception("Erro ao enviar contato %s", contact["id"])
-                        await self.db.mark_contact_failed(campaign_id, contact["id"], str(exc))
-                        result_line = f"Contato {current_number}/{total} falhou. Pulando para o proximo."
+                        category = exc.category if isinstance(exc, EvolutionError) else "generic"
+                        score = self.suspicion.bump(instance_name, category)
+                        logger.warning(
+                            "Erro ao enviar contato %s (cat=%s, suspicion=%d)",
+                            contact["id"], category, score,
+                        )
+                        await self.db.mark_contact_failed(campaign_id, contact["id"], f"[{category}] {exc}")
+                        result_line = f"Contato {current_number}/{total} falhou ({category}). Pulando para o proximo."
 
                     counts = await self.db.campaign_progress(campaign_id)
                     processed_count = counts["processed"]
                     sent_count = counts["sent"]
                     total = counts["total"] or total
+
+                    # Auto-pause se a contagem de sinais ultrapassou o limite (incluindo
+                    # bumps vindos do webhook de connection.update entre envios).
+                    if self.suspicion.get(instance_name) >= SUSPICION_LIMIT and campaign["status"] != "paused":
+                        await self._auto_pause_for_shadowban(campaign_id, instance_name, progress, counts)
+                        # _wait_if_paused na proxima iteracao segura aqui.
+                        continue
 
                     if processed_count and processed_count % profile.pause_every == 0:
                         delay = profile.pause()
@@ -279,6 +352,34 @@ class CampaignScheduler:
                 campaign_controls(campaign_id, paused=True),
             )
             await asyncio.sleep(self.progress_update_interval_seconds)
+
+    async def _auto_pause_for_shadowban(self, campaign_id: int, instance_name: str, progress, counts: dict):
+        """Pausa a campanha automaticamente ao detectar sinais de restricao.
+
+        Mantem a sessao do WhatsApp viva. Envia mensagem instrutiva pra vendedora
+        explicando o que NAO fazer (recriar instancia/desconectar) e o que fazer
+        (esperar e usar o numero manualmente).
+        """
+        score = self.suspicion.get(instance_name)
+        await self.db.set_campaign_status(campaign_id, "paused")
+        logger.warning(
+            "Auto-pause em campanha %s (instance=%s, suspicion=%d)",
+            campaign_id, instance_name, score,
+        )
+        text = (
+            f"Campanha #{campaign_id} pausada AUTOMATICAMENTE.\n\n"
+            f"O numero apresentou sinais de restricao ou instabilidade (score {score}).\n\n"
+            f"Progresso ate aqui: {counts['processed']}/{counts['total']} "
+            f"(enviados {counts['sent']}, falhas {counts['failed']}).\n\n"
+            "O QUE FAZER:\n"
+            "- NAO use /desconectar nem refaca /login.\n"
+            "- NAO recrie a instancia.\n"
+            "- Abra o WhatsApp normalmente no celular e mande mensagens manuais "
+            "para alguns contatos proximos por um tempo.\n"
+            "- Aguarde algumas horas (geralmente 4 a 12h).\n"
+            "- Quando voltar ao normal, clique em Retomar abaixo."
+        )
+        await progress.update(text, campaign_controls(campaign_id, paused=True))
 
     async def _wait_for_memory(self):
         threshold = self.min_free_memory_mb

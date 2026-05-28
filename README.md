@@ -35,6 +35,44 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 
 Durante o disparo, a mensagem de progresso tem botoes inline para pausar, retomar, cancelar com confirmacao e adicionar o ultimo destinatario a blacklist.
 
+## Pre-flight Antes Do Disparo
+
+`/disparar` agora abre um painel de pre-flight em vez de comecar imediatamente. O bot classifica os contatos pendentes em quatro grupos com base no historico de eventos (delivered/read/replied) capturados pelo webhook da Evolution:
+
+- **Quentes**: responderam em < 90 dias OU leram em < 30 dias.
+- **Mornos**: tem ao menos uma entrega confirmada e nao se enquadram em quente/frio.
+- **Frios**: ultima entrega ha mais de 180 dias OU 2+ envios seguidos sem nenhuma entrega.
+- **Sem historico**: nunca foram tocados nessa base.
+
+Botoes do painel:
+
+- **Disparar agora**: inicia a campanha como antes.
+- **Excluir frios**: marca os contatos frios como falha (`preflight: frio`) sem enviar.
+- **Verificar WhatsApp ativo**: chama `POST /chat/whatsappNumbers` na Evolution e marca como falha (`preflight: sem whatsapp`) os numeros que nao existem mais.
+- **Cancelar disparo**: fecha o painel sem mexer na campanha.
+
+Nas duas primeiras execucoes, "Frios" e "Sem historico" podem aparecer iguais (ambos sem dados); a precisao melhora a medida que os webhooks de delivered/read/replied chegam para campanhas seguintes.
+
+## Webhook Da Evolution
+
+Para alimentar o `contact_health` que sustenta o pre-flight (e mais adiante a auto-blacklist por palavra-chave de cancelamento), o bot sobe um pequeno servidor HTTP em paralelo com o poller do Telegram, dentro do mesmo container. A Evolution e configurada para chamar essa URL por instancia.
+
+Configuracao no `.env`:
+
+```env
+WEBHOOK_LISTEN_HOST=0.0.0.0
+WEBHOOK_LISTEN_PORT=8090
+WEBHOOK_TOKEN=
+WEBHOOK_PUBLIC_URL=
+WEBHOOK_AUTO_CONFIGURE=true
+```
+
+- `WEBHOOK_PUBLIC_URL` e a URL que a Evolution chama. Como bot e Evolution rodam na mesma rede `bot-net` do Docker, o nome do container resolve internamente. **A porta nao precisa ser exposta para fora da VPS**.
+- Se `WEBHOOK_TOKEN` e `WEBHOOK_PUBLIC_URL` ficarem vazios, o bot gera um token estavel a partir da `EVOLUTION_API_KEY` e usa `http://whatsapp-bot-v2:8090/webhook/<token>`.
+- `WEBHOOK_TOKEN` aparece tanto na URL quanto na rota. Vale como camada extra de auth alem do isolamento da rede.
+- `WEBHOOK_AUTO_CONFIGURE=true` faz o bot, no boot e quando a vendedora abre/conecta sessao, reconfigurar o webhook da instancia. Idempotente.
+- O webhook escuta os eventos `MESSAGES_UPSERT` (resposta do cliente), `MESSAGES_UPDATE` (delivered/read), `CONNECTION_UPDATE` (logado para diagnostico) e `SEND_MESSAGE` (confirmacao do envio).
+
 ## Perfis
 
 ### Precaucao

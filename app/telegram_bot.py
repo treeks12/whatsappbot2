@@ -21,7 +21,7 @@ from telegram.ext import (
 from .config import Settings
 from .csv_utils import mime_from_name, parse_contacts_file, parse_contacts_vcf_text, usable_phone
 from .db import Database
-from .evolution import EvolutionClient
+from .evolution import EvolutionClient, normalize_phone
 from .evolution_power import EvolutionPowerManager
 from .profiles import get_profile
 from .scheduler import CampaignScheduler, campaign_controls, cancel_confirmation_controls
@@ -136,6 +136,15 @@ def power_service(context: ContextTypes.DEFAULT_TYPE) -> EvolutionPowerManager:
     return context.application.bot_data["power"]
 
 
+async def ensure_instance_webhook(settings: Settings, evolution: EvolutionClient, instance_name: str):
+    if not (settings.webhook_auto_configure and settings.webhook_public_url and settings.webhook_token):
+        return
+    try:
+        await evolution.set_instance_webhook(instance_name, settings.webhook_public_url)
+    except Exception:
+        logger.warning("Falha ao configurar webhook em %s", instance_name, exc_info=True)
+
+
 def is_authorized(settings: Settings, user_id: int) -> bool:
     return not settings.telegram_admin_ids or user_id in settings.telegram_admin_ids
 
@@ -211,6 +220,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = await evolution.connection_state(instance_name)
     if state == "open":
+        await ensure_instance_webhook(settings, evolution, instance_name)
         await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
         schedule_idle_stop(context)
         return
@@ -226,6 +236,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not image:
         state = await evolution.connection_state(instance_name)
         if state == "open":
+            await ensure_instance_webhook(settings, evolution, instance_name)
             await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
         else:
             await update.message.reply_text(
@@ -245,7 +256,7 @@ async def conexao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update, context):
         return
 
-    _, db, evolution, _ = services(context)
+    settings, db, evolution, _ = services(context)
     power = power_service(context)
     user = update.effective_user
     instance_name = f"vendor_{user.id}"
@@ -260,6 +271,8 @@ async def conexao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Erro ao verificar Evolution: {exc}")
         return
     state = await evolution.connection_state(instance_name)
+    if state == "open":
+        await ensure_instance_webhook(settings, evolution, instance_name)
     await update.message.reply_text(f"Conexao WhatsApp: {state}.")
     schedule_idle_stop(context)
 
@@ -349,10 +362,11 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         state = await evolution.connection_state(instance_name)
         if state == "open":
+            await ensure_instance_webhook(settings, evolution, instance_name)
             profile_id = profile_from_command(update, settings.default_profile)
             context.user_data["pending_campaign_profile_id"] = profile_id
             await show_campaign_contact_source(update.message, db, user.id, profile_id)
-            await power.stop_if_idle(db)
+            schedule_idle_stop(context)
             return WAITING_CONTACT_SOURCE
         else:
             await update.message.reply_text(f"Conexao ainda nao abriu. Estado atual: {state}. Rode /conexao para verificar.")
@@ -361,6 +375,7 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     profile_id = profile_from_command(update, settings.default_profile)
     context.user_data["pending_campaign_profile_id"] = profile_id
+    await ensure_instance_webhook(settings, evolution, instance_name)
     await show_campaign_contact_source(update.message, db, user.id, profile_id)
     schedule_idle_stop(context)
     return WAITING_CONTACT_SOURCE
@@ -1110,8 +1125,7 @@ async def disparar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update, context):
         return
 
-    _, db, evolution, scheduler = services(context)
-    power = power_service(context)
+    _, db, _, _ = services(context)
     campaign = await db.get_active_campaign_for_vendor(update.effective_user.id)
     if not campaign:
         await update.message.reply_text("Nenhuma campanha ativa.")
@@ -1121,23 +1135,107 @@ async def disparar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Campanha #{campaign['id']} esta em status {campaign['status']}.")
         return
 
-    campaign_with_vendor = await db.get_campaign_with_vendor(campaign["id"])
+    text, keyboard = await _build_preflight(db, campaign["id"], campaign["vendor_id"])
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def _build_preflight(db: Database, campaign_id: int, vendor_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    phones = await db.pending_phones_for_campaign(campaign_id)
+    classification = await db.classify_phones(vendor_id, phones)
+    counts = {"hot": 0, "warm": 0, "cold": 0, "unknown": 0}
+    for cls in classification.values():
+        counts[cls] = counts.get(cls, 0) + 1
+
+    lines = [
+        f"Campanha #{campaign_id} - pre-flight",
+        f"Pendentes: {len(phones)}",
+        "",
+        f"  Quentes (responderam < 90d ou leram < 30d): {counts['hot']}",
+        f"  Mornos (entregaram, sem resposta recente):  {counts['warm']}",
+        f"  Frios (sem entrega ha muito tempo):         {counts['cold']}",
+        f"  Sem historico nesta base:                   {counts['unknown']}",
+    ]
+    if not phones:
+        lines.append("")
+        lines.append("Nenhum contato pendente para disparar.")
+    if counts["cold"]:
+        lines.append("")
+        lines.append("Bloqueado: exclua os frios antes de disparar.")
+
+    keyboard_rows = []
+    if phones and not counts["cold"]:
+        keyboard_rows.append([InlineKeyboardButton("Disparar agora", callback_data=f"disparar_go:{campaign_id}")])
+    if counts["cold"]:
+        keyboard_rows.append(
+            [InlineKeyboardButton("Excluir frios", callback_data=f"disparar_drop_cold:{campaign_id}")]
+        )
+    if phones:
+        keyboard_rows.append(
+            [InlineKeyboardButton("Verificar WhatsApp ativo", callback_data=f"disparar_check_wa:{campaign_id}")]
+        )
+    keyboard_rows.append(
+        [InlineKeyboardButton("Cancelar disparo", callback_data=f"disparar_cancel:{campaign_id}")]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
+
+
+def _whatsapp_result_exists(item: dict) -> bool:
+    for key in ("exists", "isWhatsApp", "isWhatsapp"):
+        if key in item:
+            return bool(item.get(key))
+    return bool(item.get("jid") or item.get("id"))
+
+
+def _whatsapp_result_phone(item: dict) -> str:
+    for key in ("number", "phone", "jid", "id"):
+        value = str(item.get(key) or "").strip()
+        if not value or "@lid" in value:
+            continue
+        digits = normalize_phone(value)
+        if digits:
+            return digits
+    return ""
+
+
+async def _start_dispatch(query, context: ContextTypes.DEFAULT_TYPE, campaign_id: int):
+    settings, db, evolution, scheduler = services(context)
+    power = power_service(context)
+
+    campaign = await db.get_campaign_with_vendor(campaign_id)
+    if not campaign:
+        await safe_edit_query_text(query, "Campanha nao encontrada.")
+        return
+
+    phones = await db.pending_phones_for_campaign(campaign_id)
+    classification = await db.classify_phones(campaign["vendor_id"], phones)
+    cold_count = sum(1 for cls in classification.values() if cls == "cold")
+    if cold_count:
+        text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+        await safe_edit_query_text(query, text, reply_markup=keyboard)
+        return
+    if not phones:
+        text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+        await safe_edit_query_text(query, text, reply_markup=keyboard)
+        return
+
     try:
         await power.ensure_running()
     except Exception as exc:
         logger.exception("Erro ao ligar Evolution")
-        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
+        await safe_edit_query_text(query, f"Erro ao ligar Evolution: {exc}")
         return
-    state = await evolution.connection_state(campaign_with_vendor["instance_name"])
+
+    state = await evolution.connection_state(campaign["instance_name"])
     if state != "open":
-        status_message = await update.message.reply_text("Aguardando conexao do WhatsApp abrir...")
-        if not await evolution.wait_until_open(campaign_with_vendor["instance_name"]):
-            await status_message.edit_text("WhatsApp nao esta conectado. Use /login antes de disparar.")
+        await safe_edit_query_text(query, "Aguardando conexao do WhatsApp abrir...")
+        if not await evolution.wait_until_open(campaign["instance_name"]):
+            await safe_edit_query_text(query, "WhatsApp nao esta conectado. Use /login antes de disparar.")
             await power.stop_if_idle(db)
             return
 
-    progress_message = await update.message.reply_text("Preparando campanha...")
-    ok = await scheduler.start(campaign["id"], update.effective_chat.id, progress_message.message_id)
+    await ensure_instance_webhook(settings, evolution, campaign["instance_name"])
+    progress_message = await context.bot.send_message(query.message.chat_id, "Preparando campanha...")
+    ok = await scheduler.start(campaign_id, query.message.chat_id, progress_message.message_id)
     if not ok:
         await progress_message.edit_text("Campanha ja esta em execucao.")
 
@@ -1180,6 +1278,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("campaign_"):
         await handle_campaign_callback(update, context)
+        return
+
+    if data.startswith("disparar_"):
+        await handle_disparar_callback(update, context)
         return
 
     if data.startswith("bl_"):
@@ -1315,6 +1417,134 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
             query,
             f"Campanha #{campaign_id} cancelada." if ok else f"Campanha #{campaign_id} nao estava ativa."
         )
+        return
+
+    await query.answer("Acao desconhecida.", show_alert=True)
+
+
+async def handle_disparar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    settings, db, evolution, _ = services(context)
+
+    try:
+        action, raw_campaign_id = data.split(":", 1)
+        campaign_id = int(raw_campaign_id)
+    except ValueError:
+        await query.answer("Acao invalida.", show_alert=True)
+        return
+
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign:
+        await query.answer("Campanha nao encontrada.", show_alert=True)
+        return
+    if campaign["vendor_id"] != query.from_user.id and not is_authorized(settings, query.from_user.id):
+        await query.answer("Sem permissao.", show_alert=True)
+        return
+    if campaign["status"] != "ready":
+        await query.answer(f"Campanha esta em status {campaign['status']}.", show_alert=True)
+        return
+
+    if action == "disparar_cancel":
+        await query.answer("Disparo cancelado. Campanha continua pronta.")
+        await safe_edit_query_text(
+            query,
+            f"Disparo da campanha #{campaign_id} cancelado.\nUse /disparar quando quiser revisitar.",
+        )
+        return
+
+    if action == "disparar_drop_cold":
+        phones = await db.pending_phones_for_campaign(campaign_id)
+        classification = await db.classify_phones(campaign["vendor_id"], phones)
+        cold_phones = [p for p, cls in classification.items() if cls == "cold"]
+        removed = await db.fail_pending_phones(campaign_id, cold_phones, "preflight: frio")
+        await query.answer(f"Removidos {removed} contatos frios.")
+        text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+        await safe_edit_query_text(query, text, reply_markup=keyboard)
+        return
+
+    if action == "disparar_check_wa":
+        await query.answer("Verificando numeros no WhatsApp...")
+        campaign_with_vendor = await db.get_campaign_with_vendor(campaign_id)
+        instance_name = campaign_with_vendor["instance_name"]
+        # Garante que a Evolution esta no ar antes de chamar.
+        try:
+            await power_service(context).ensure_running()
+        except Exception:
+            logger.exception("Erro ao ligar Evolution para verificar numeros")
+            await safe_edit_query_text(query, "Nao consegui ligar a Evolution para verificar numeros.")
+            return
+
+        phones = await db.pending_phones_for_campaign(campaign_id)
+        invalid: set[str] = set()
+        checked = 0
+        errors: list[str] = []
+        # Quebra em batches para nao mandar uma lista enorme num POST.
+        for chunk_start in range(0, len(phones), 50):
+            chunk = phones[chunk_start : chunk_start + 50]
+            try:
+                results = await evolution.whatsapp_numbers(instance_name, chunk)
+            except Exception as exc:
+                logger.exception("Erro em whatsapp_numbers (chunk %d)", chunk_start)
+                errors.append(str(exc)[:160])
+                continue
+            checked += len(chunk)
+            seen_existing = set()
+            for index, item in enumerate(results):
+                if not isinstance(item, dict):
+                    continue
+                number = _whatsapp_result_phone(item)
+                exists = _whatsapp_result_exists(item)
+                if exists and not number and index < len(chunk):
+                    number = chunk[index]
+                jid = item.get("jid") or ""
+                if exists:
+                    seen_existing.add(number)
+                    if "@lid" in jid and number:
+                        # Aproveita pra linkar phone <-> @lid em contact_health.
+                        try:
+                            await db.link_chat_lid(campaign["vendor_id"], number, jid)
+                        except Exception:
+                            logger.debug("Falha ao linkar @lid", exc_info=True)
+            for phone in chunk:
+                if phone not in seen_existing:
+                    invalid.add(phone)
+
+        if errors:
+            text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+            await safe_edit_query_text(
+                query,
+                "Verificacao incompleta. Nada foi removido.\n"
+                "Tente novamente quando a Evolution estiver estavel.\n\n"
+                + text,
+                reply_markup=keyboard,
+            )
+            return
+
+        if checked != len(phones):
+            text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+            await safe_edit_query_text(
+                query,
+                "Verificacao incompleta. Nada foi removido.\n"
+                "Nem todos os contatos pendentes foram conferidos.\n\n"
+                + text,
+                reply_markup=keyboard,
+            )
+            return
+
+        removed = await db.fail_pending_phones(campaign_id, invalid, "preflight: sem whatsapp")
+        text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+        prefix = (
+            f"Verificacao: {removed} numeros sem WhatsApp foram removidos.\n\n"
+            if removed
+            else f"Verificacao: {checked} pendentes conferidos, todos existem no WhatsApp.\n\n"
+        )
+        await safe_edit_query_text(query, prefix + text, reply_markup=keyboard)
+        return
+
+    if action == "disparar_go":
+        await query.answer("Iniciando campanha...")
+        await _start_dispatch(query, context, campaign_id)
         return
 
     await query.answer("Acao desconhecida.", show_alert=True)

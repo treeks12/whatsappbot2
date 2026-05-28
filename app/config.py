@@ -1,3 +1,4 @@
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,14 +54,31 @@ class Settings:
     evolution_idle_stop_seconds: int
     contact_list_snapshot_keep: int
     contact_list_snapshot_days: int
+    webhook_listen_host: str
+    webhook_listen_port: int
+    webhook_token: str
+    webhook_public_url: str
+    webhook_auto_configure: bool
 
 
 def load_settings() -> Settings:
+    evolution_api_key = os.getenv("EVOLUTION_API_KEY", "")
+    webhook_token = (os.getenv("WEBHOOK_TOKEN", "") or "").strip()
+    webhook_auto_configure = _bool_env("WEBHOOK_AUTO_CONFIGURE", True)
+    webhook_listen_port = _int_env("WEBHOOK_LISTEN_PORT", 8090)
+    if not webhook_token and webhook_auto_configure and evolution_api_key:
+        digest = hashlib.sha256(evolution_api_key.encode("utf-8")).hexdigest()
+        webhook_token = f"wh_{digest[:32]}"
+
+    webhook_public_url = (os.getenv("WEBHOOK_PUBLIC_URL", "") or "").rstrip("/")
+    if not webhook_public_url and webhook_token:
+        webhook_public_url = f"http://whatsapp-bot-v2:{webhook_listen_port}/webhook/{webhook_token}"
+
     return Settings(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_admin_ids=_admin_ids(),
         evolution_api_url=os.getenv("EVOLUTION_API_URL", "http://evolution-api:8080").rstrip("/"),
-        evolution_api_key=os.getenv("EVOLUTION_API_KEY", ""),
+        evolution_api_key=evolution_api_key,
         database_path=Path(os.getenv("DATABASE_PATH", "/app/data/bot.sqlite3")),
         campaigns_dir=Path(os.getenv("CAMPAIGNS_DIR", "/app/campaigns")),
         max_clients_per_campaign=_int_env("MAX_CLIENTS_PER_CAMPAIGN", 0),
@@ -80,4 +98,9 @@ def load_settings() -> Settings:
         evolution_idle_stop_seconds=_int_env("EVOLUTION_IDLE_STOP_SECONDS", 600),
         contact_list_snapshot_keep=_int_env("CONTACT_LIST_SNAPSHOT_KEEP", 3),
         contact_list_snapshot_days=_int_env("CONTACT_LIST_SNAPSHOT_DAYS", 14),
+        webhook_listen_host=os.getenv("WEBHOOK_LISTEN_HOST", "0.0.0.0"),
+        webhook_listen_port=webhook_listen_port,
+        webhook_token=webhook_token,
+        webhook_public_url=webhook_public_url,
+        webhook_auto_configure=webhook_auto_configure,
     )

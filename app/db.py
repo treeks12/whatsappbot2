@@ -130,6 +130,26 @@ CREATE TABLE IF NOT EXISTS blacklist (
 
 CREATE INDEX IF NOT EXISTS idx_blacklist_phone ON blacklist(phone);
 CREATE INDEX IF NOT EXISTS idx_blacklist_added_at ON blacklist(added_at);
+
+CREATE TABLE IF NOT EXISTS contact_health (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id INTEGER NOT NULL,
+    phone TEXT NOT NULL,
+    chat_lid TEXT,
+    last_sent_at TEXT,
+    last_delivered_at TEXT,
+    last_read_at TEXT,
+    last_replied_at TEXT,
+    last_reply_text TEXT,
+    consecutive_no_delivery INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(vendor_id, phone),
+    FOREIGN KEY(vendor_id) REFERENCES vendors(telegram_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_health_phone ON contact_health(phone);
+CREATE INDEX IF NOT EXISTS idx_contact_health_chat_lid ON contact_health(chat_lid);
+CREATE INDEX IF NOT EXISTS idx_contact_health_vendor ON contact_health(vendor_id);
 """
 
 
@@ -377,6 +397,43 @@ class Database:
                     """,
                     (campaign_id,),
                 ).fetchone()
+
+    async def pending_phones_for_campaign(self, campaign_id: int) -> list[str]:
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT phone FROM contacts
+                    WHERE campaign_id = ? AND status = 'pending'
+                    """,
+                    (campaign_id,),
+                ).fetchall()
+                return [row["phone"] for row in rows if row["phone"]]
+
+    async def fail_pending_phones(self, campaign_id: int, phones: Iterable[str], reason: str) -> int:
+        unique = sorted({p for p in (phones or []) if p})
+        if not unique:
+            return 0
+        async with self._lock:
+            with self.connect() as conn:
+                affected = 0
+                for chunk_start in range(0, len(unique), 500):
+                    chunk = unique[chunk_start : chunk_start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur = conn.execute(
+                        f"""
+                        UPDATE contacts
+                        SET status = 'failed', error = ?
+                        WHERE campaign_id = ?
+                          AND status = 'pending'
+                          AND phone IN ({placeholders})
+                        """,
+                        (reason[:200], campaign_id, *chunk),
+                    )
+                    affected += cur.rowcount
+                if affected:
+                    self._refresh_campaign_counter(conn, campaign_id)
+                return int(affected)
 
     async def mark_contact_sent(self, campaign_id: int, contact_id: int, phone: str):
         async with self._lock:
@@ -996,6 +1053,231 @@ class Database:
             self._refresh_campaign_counter(conn, int(row["campaign_id"]))
 
         return int(affected_rows)
+
+    # ------------------------------------------------------------------
+    # contact_health
+    # ------------------------------------------------------------------
+
+    async def record_send_attempt(self, vendor_id: int, phone: str, chat_lid: Optional[str] = None):
+        """Registra que se enviou para esse contato. Incrementa o streak de
+        'sem entrega' (resetado por record_event('delivered'))."""
+        clean = (phone or "").strip()
+        if not clean:
+            return
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO contact_health (vendor_id, phone, chat_lid, last_sent_at, consecutive_no_delivery, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(vendor_id, phone) DO UPDATE SET
+                        last_sent_at = CURRENT_TIMESTAMP,
+                        chat_lid = COALESCE(excluded.chat_lid, contact_health.chat_lid),
+                        consecutive_no_delivery = contact_health.consecutive_no_delivery + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (vendor_id, clean, chat_lid),
+                )
+
+    async def record_event(
+        self,
+        vendor_id: int,
+        phone: Optional[str],
+        event: str,
+        chat_lid: Optional[str] = None,
+        text: Optional[str] = None,
+    ):
+        """Marca um evento ('delivered'|'read'|'replied') para o contato.
+
+        Se `phone` for None (so vem `chat_lid`), tenta resolver pelo chat_lid existente.
+        Se nada for encontrado, ignora silenciosamente (caso @lid-only sem mapeamento).
+        """
+        if event not in ("delivered", "read", "replied"):
+            return
+        clean_phone = (phone or "").strip()
+        clean_lid = (chat_lid or "").strip() or None
+
+        async with self._lock:
+            with self.connect() as conn:
+                resolved_phone = clean_phone or self._resolve_phone_by_lid(conn, vendor_id, clean_lid)
+                if not resolved_phone:
+                    return
+
+                column = {
+                    "delivered": "last_delivered_at",
+                    "read": "last_read_at",
+                    "replied": "last_replied_at",
+                }[event]
+
+                # Garante a linha (caso o evento chegue antes de qualquer record_send_attempt).
+                conn.execute(
+                    """
+                    INSERT INTO contact_health (vendor_id, phone, chat_lid, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(vendor_id, phone) DO NOTHING
+                    """,
+                    (vendor_id, resolved_phone, clean_lid),
+                )
+
+                if event == "delivered":
+                    conn.execute(
+                        f"""
+                        UPDATE contact_health
+                        SET {column} = CURRENT_TIMESTAMP,
+                            chat_lid = COALESCE(?, chat_lid),
+                            consecutive_no_delivery = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE vendor_id = ? AND phone = ?
+                        """,
+                        (clean_lid, vendor_id, resolved_phone),
+                    )
+                elif event == "replied":
+                    conn.execute(
+                        f"""
+                        UPDATE contact_health
+                        SET {column} = CURRENT_TIMESTAMP,
+                            last_reply_text = ?,
+                            chat_lid = COALESCE(?, chat_lid),
+                            consecutive_no_delivery = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE vendor_id = ? AND phone = ?
+                        """,
+                        ((text or "")[:500], clean_lid, vendor_id, resolved_phone),
+                    )
+                else:  # read
+                    conn.execute(
+                        f"""
+                        UPDATE contact_health
+                        SET {column} = CURRENT_TIMESTAMP,
+                            chat_lid = COALESCE(?, chat_lid),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE vendor_id = ? AND phone = ?
+                        """,
+                        (clean_lid, vendor_id, resolved_phone),
+                    )
+
+    def _resolve_phone_by_lid(self, conn: sqlite3.Connection, vendor_id: int, chat_lid: Optional[str]) -> Optional[str]:
+        if not chat_lid:
+            return None
+        row = conn.execute(
+            "SELECT phone FROM contact_health WHERE vendor_id = ? AND chat_lid = ? LIMIT 1",
+            (vendor_id, chat_lid),
+        ).fetchone()
+        return row["phone"] if row else None
+
+    async def link_chat_lid(self, vendor_id: int, phone: str, chat_lid: str):
+        """Backfill da relacao phone <-> @lid quando descobrimos via whatsappNumbers."""
+        if not phone or not chat_lid:
+            return
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO contact_health (vendor_id, phone, chat_lid, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(vendor_id, phone) DO UPDATE SET
+                        chat_lid = excluded.chat_lid,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (vendor_id, phone, chat_lid),
+                )
+
+    async def get_contact_health(self, vendor_id: int, phone: str) -> Optional[sqlite3.Row]:
+        async with self._lock:
+            with self.connect() as conn:
+                return conn.execute(
+                    "SELECT * FROM contact_health WHERE vendor_id = ? AND phone = ?",
+                    (vendor_id, phone),
+                ).fetchone()
+
+    async def classify_phones(
+        self,
+        vendor_id: int,
+        phones: Iterable[str],
+        hot_reply_days: int = 90,
+        hot_read_days: int = 30,
+        warm_delivered_days: int = 180,
+        cold_no_delivery_streak: int = 2,
+    ) -> dict:
+        """Classifica cada telefone como 'hot' | 'warm' | 'cold' | 'unknown'.
+
+        - hot:    respondeu em <= hot_reply_days OU leu em <= hot_read_days
+        - warm:   tem ao menos uma entrega registrada e nao se enquadra em hot/cold
+        - cold:   streak de envios sem delivery >= cold_no_delivery_streak,
+                  ou ultima entrega foi ha mais de warm_delivered_days
+        - unknown: nunca foi tocado nesse vendor (sem registro em contact_health)
+        """
+        unique = sorted({p for p in phones if p})
+        if not unique:
+            return {}
+
+        async with self._lock:
+            with self.connect() as conn:
+                rows: dict[str, sqlite3.Row] = {}
+                for chunk_start in range(0, len(unique), 500):
+                    chunk = unique[chunk_start : chunk_start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    fetched = conn.execute(
+                        f"""
+                        SELECT phone, last_sent_at, last_delivered_at, last_read_at,
+                               last_replied_at, consecutive_no_delivery
+                        FROM contact_health
+                        WHERE vendor_id = ?
+                          AND phone IN ({placeholders})
+                        """,
+                        (vendor_id, *chunk),
+                    ).fetchall()
+                    for row in fetched:
+                        rows[row["phone"]] = row
+
+        from datetime import datetime
+
+        def _parse(ts: Optional[str]):
+            if not ts:
+                return None
+            try:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                try:
+                    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    return None
+
+        now = datetime.utcnow()
+        result: dict[str, str] = {}
+        for phone in unique:
+            row = rows.get(phone)
+            if row is None:
+                result[phone] = "unknown"
+                continue
+
+            replied = _parse(row["last_replied_at"])
+            read = _parse(row["last_read_at"])
+            delivered = _parse(row["last_delivered_at"])
+            streak = int(row["consecutive_no_delivery"] or 0)
+
+            if (replied and (now - replied).days <= hot_reply_days) or (
+                read and (now - read).days <= hot_read_days
+            ):
+                result[phone] = "hot"
+                continue
+
+            cold = False
+            if delivered and (now - delivered).days > warm_delivered_days:
+                cold = True
+            elif streak >= cold_no_delivery_streak and not delivered:
+                cold = True
+
+            if cold:
+                result[phone] = "cold"
+            elif delivered:
+                result[phone] = "warm"
+            else:
+                # Tem registro mas sem delivery confirmado e streak baixo: trata como warm cauteloso.
+                result[phone] = "warm"
+
+        return result
+
     def _collect_blacklist_hits(self, conn: sqlite3.Connection, phones: Iterable[str]) -> set[str]:
         """Versao sincrona de filter_blacklisted, para usar dentro de uma transacao aberta."""
         unique = sorted({p for p in (phones or []) if p})
