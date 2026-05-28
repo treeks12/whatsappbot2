@@ -70,7 +70,7 @@ WEBHOOK_AUTO_CONFIGURE=true
 - `WEBHOOK_PUBLIC_URL` e a URL que a Evolution chama. Como bot e Evolution rodam na mesma rede `bot-net` do Docker, o nome do container resolve internamente. **A porta nao precisa ser exposta para fora da VPS**.
 - Se `WEBHOOK_TOKEN` e `WEBHOOK_PUBLIC_URL` ficarem vazios, o bot gera um token estavel a partir da `EVOLUTION_API_KEY` e usa `http://whatsapp-bot-v2:8090/webhook/<token>`.
 - `WEBHOOK_TOKEN` aparece tanto na URL quanto na rota. Vale como camada extra de auth alem do isolamento da rede.
-- `WEBHOOK_AUTO_CONFIGURE=true` faz o bot, no boot e quando a vendedora abre/conecta sessao, reconfigurar o webhook da instancia. Idempotente.
+- `WEBHOOK_AUTO_CONFIGURE=true` faz o bot tentar reconfigurar webhooks no boot se a Evolution ja estiver pronta, e sempre que a vendedora abre/conecta sessao. Idempotente.
 - O webhook escuta os eventos `MESSAGES_UPSERT` (resposta do cliente), `MESSAGES_UPDATE` (delivered/read), `CONNECTION_UPDATE` (logado para diagnostico) e `SEND_MESSAGE` (confirmacao do envio).
 
 ## Perfis

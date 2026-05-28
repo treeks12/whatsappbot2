@@ -72,7 +72,11 @@ async def post_init(application: Application):
         and settings.webhook_public_url
         and settings.webhook_token
     ):
-        await _reconfigure_vendor_instances(db, evolution, settings.webhook_public_url)
+        try:
+            await evolution.info()
+            await _reconfigure_vendor_instances(db, evolution, settings.webhook_public_url)
+        except Exception:
+            logger.info("Webhook no boot adiado: Evolution ainda nao respondeu.")
     await power.stop_if_idle(db)
     logger.info("Bot v2 inicializado")
 
