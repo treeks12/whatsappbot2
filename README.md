@@ -35,6 +35,10 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 
 Durante o disparo, a mensagem de progresso tem botoes inline para pausar, retomar, cancelar com confirmacao e adicionar o ultimo destinatario a blacklist.
 
+## Ordem Da Fila
+
+Os contatos importados mantem `row_index` para auditoria, mas a ordem de envio usa `dispatch_order`. Essa ordem e calculada uma vez por campanha e intercala DDDs/grupos de telefone, evitando que listas importadas com DDDs vizinhos saiam em blocos longos. A ordem fica salva no SQLite, entao reiniciar o bot nao embaralha a campanha de novo.
+
 ## Pre-flight Antes Do Disparo
 
 `/disparar` agora abre um painel de pre-flight em vez de comecar imediatamente. O bot classifica os contatos pendentes em quatro grupos com base no historico de eventos (delivered/read/replied) capturados pelo webhook da Evolution:

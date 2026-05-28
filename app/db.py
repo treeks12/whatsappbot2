@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import sqlite3
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     campaign_id INTEGER NOT NULL,
     row_index INTEGER NOT NULL,
+    dispatch_order INTEGER,
     name TEXT,
     phone TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -174,6 +177,7 @@ class Database:
         async with self._lock:
             with self.connect() as conn:
                 conn.executescript(SCHEMA)
+                self._migrate_schema(conn)
                 self._cleanup_orphan_records(conn)
                 self._refresh_campaign_counters(conn)
 
@@ -339,6 +343,7 @@ class Database:
                     "INSERT OR IGNORE INTO contacts (campaign_id, row_index, name, phone) VALUES (?, ?, ?, ?)",
                     rows,
                 )
+                self._rebalance_campaign_dispatch_order(conn, campaign_id)
                 total = conn.execute(
                     "SELECT COUNT(*) FROM contacts WHERE campaign_id = ?",
                     (campaign_id,),
@@ -393,7 +398,7 @@ class Database:
                     WHERE campaign_id = ?
                       AND status = 'pending'
                       AND phone NOT IN (SELECT phone FROM blacklist)
-                    ORDER BY row_index LIMIT 1
+                    ORDER BY COALESCE(dispatch_order, row_index), row_index, id LIMIT 1
                     """,
                     (campaign_id,),
                 ).fetchone()
@@ -727,6 +732,7 @@ class Database:
                     """,
                     [(campaign_id, index, name, phone) for index, (name, phone) in enumerate(accepted)],
                 )
+                self._rebalance_campaign_dispatch_order(conn, campaign_id)
                 total = conn.execute("SELECT COUNT(*) FROM contacts WHERE campaign_id = ?", (campaign_id,)).fetchone()[0]
                 conn.execute("UPDATE campaigns SET total_contacts = ? WHERE id = ?", (total, campaign_id))
                 return {"total": int(total), "blacklisted": len(blacklisted)}
@@ -1295,6 +1301,43 @@ class Database:
                 hits.add(row["phone"])
         return hits
 
+    def _migrate_schema(self, conn: sqlite3.Connection):
+        contact_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(contacts)").fetchall()
+        }
+        if "dispatch_order" not in contact_columns:
+            conn.execute("ALTER TABLE contacts ADD COLUMN dispatch_order INTEGER")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contacts_campaign_dispatch
+            ON contacts(campaign_id, status, dispatch_order, row_index, id)
+            """
+        )
+        rows = conn.execute(
+            "SELECT DISTINCT campaign_id FROM contacts WHERE dispatch_order IS NULL"
+        ).fetchall()
+        for row in rows:
+            self._rebalance_campaign_dispatch_order(conn, int(row["campaign_id"]))
+
+    def _rebalance_campaign_dispatch_order(self, conn: sqlite3.Connection, campaign_id: int):
+        rows = conn.execute(
+            """
+            SELECT id, phone, row_index
+            FROM contacts
+            WHERE campaign_id = ?
+            ORDER BY row_index, id
+            """,
+            (campaign_id,),
+        ).fetchall()
+        if not rows:
+            return
+        ordered = _spread_contact_rows(rows, campaign_id)
+        conn.executemany(
+            "UPDATE contacts SET dispatch_order = ? WHERE id = ?",
+            [(index, int(row["id"])) for index, row in enumerate(ordered)],
+        )
+
     def _cleanup_orphan_records(self, conn: sqlite3.Connection):
         conn.execute(
             """
@@ -1362,3 +1405,40 @@ class Database:
 
 def _generic_name(name: Optional[str]) -> bool:
     return not name or name.strip().lower() in ("cliente", "contato", "sem nome")
+
+
+def _spread_contact_rows(rows: list[sqlite3.Row], campaign_id: int) -> list[sqlite3.Row]:
+    groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        groups[_phone_area_code(row["phone"])].append(row)
+
+    def stable_key(*parts) -> str:
+        raw = ":".join(str(part) for part in parts)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    for area, items in groups.items():
+        items.sort(key=lambda row: stable_key("contact", campaign_id, area, row["phone"], row["id"]))
+
+    area_order = sorted(groups, key=lambda area: stable_key("area", campaign_id, area))
+    result: list[sqlite3.Row] = []
+    round_index = 0
+    while True:
+        active = [area for area in area_order if groups[area]]
+        if not active:
+            return result
+        if active:
+            rotation = round_index % len(active)
+            active = active[rotation:] + active[:rotation]
+        for area in active:
+            if groups[area]:
+                result.append(groups[area].pop(0))
+        round_index += 1
+
+
+def _phone_area_code(phone: str) -> str:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if digits.startswith("55") and len(digits) >= 4:
+        return digits[2:4]
+    if len(digits) >= 2:
+        return digits[:2]
+    return "unknown"
