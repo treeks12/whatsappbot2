@@ -389,7 +389,10 @@ def campaign_controls(campaign_id: int, paused: bool = False) -> InlineKeyboardM
     else:
         first = InlineKeyboardButton("Pausar", callback_data=f"campaign_pause:{campaign_id}")
     return InlineKeyboardMarkup(
-        [[first, InlineKeyboardButton("Cancelar", callback_data=f"campaign_cancel_ask:{campaign_id}")]]
+        [
+            [first, InlineKeyboardButton("Cancelar", callback_data=f"campaign_cancel_ask:{campaign_id}")],
+            [InlineKeyboardButton("Adicionar ultimo a blacklist", callback_data=f"bl_add_last:{campaign_id}")],
+        ]
     )
 
 

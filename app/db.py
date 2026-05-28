@@ -116,6 +116,20 @@ CREATE TABLE IF NOT EXISTS contact_list_snapshot_contacts (
 CREATE INDEX IF NOT EXISTS idx_contact_lists_vendor ON contact_lists(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_contact_list_contacts_list ON contact_list_contacts(list_id);
 CREATE INDEX IF NOT EXISTS idx_contact_list_snapshots_list ON contact_list_snapshots(list_id, created_at);
+
+CREATE TABLE IF NOT EXISTS blacklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL UNIQUE,
+    reason_code TEXT NOT NULL,
+    reason_note TEXT,
+    source TEXT NOT NULL,
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    added_by_user_id INTEGER,
+    added_by_vendor_id INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_blacklist_phone ON blacklist(phone);
+CREATE INDEX IF NOT EXISTS idx_blacklist_added_at ON blacklist(added_at);
 """
 
 
@@ -285,17 +299,32 @@ class Database:
             with self.connect() as conn:
                 conn.execute("UPDATE campaigns SET caption = ?, status = 'ready' WHERE id = ?", (caption, campaign_id))
 
-    async def add_contacts(self, campaign_id: int, contacts: Iterable[dict]):
-        rows = [(campaign_id, item["row_index"], item.get("name"), item["phone"]) for item in contacts]
+    async def add_contacts(self, campaign_id: int, contacts: Iterable[dict]) -> dict:
+        """Insere contatos na campanha, ignorando os que estao em blacklist.
+
+        Retorna dict com `total` (contatos finais na campanha) e `blacklisted`
+        (quantos foram filtrados pela blacklist).
+        """
+        materialized = list(contacts)
         async with self._lock:
             with self.connect() as conn:
+                phones = {item["phone"] for item in materialized if item.get("phone")}
+                blacklisted = self._collect_blacklist_hits(conn, phones)
+                accepted = [item for item in materialized if item.get("phone") not in blacklisted]
+                rows = [
+                    (campaign_id, item["row_index"], item.get("name"), item["phone"])
+                    for item in accepted
+                ]
                 conn.executemany(
                     "INSERT OR IGNORE INTO contacts (campaign_id, row_index, name, phone) VALUES (?, ?, ?, ?)",
                     rows,
                 )
-                total = conn.execute("SELECT COUNT(*) FROM contacts WHERE campaign_id = ?", (campaign_id,)).fetchone()[0]
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM contacts WHERE campaign_id = ?",
+                    (campaign_id,),
+                ).fetchone()[0]
                 conn.execute("UPDATE campaigns SET total_contacts = ? WHERE id = ?", (total, campaign_id))
-                return total
+                return {"total": int(total), "blacklisted": len(blacklisted)}
 
     async def add_media(self, campaign_id: int, path: str, mime_type: str, file_name: str):
         async with self._lock:
@@ -339,8 +368,11 @@ class Database:
             with self.connect() as conn:
                 return conn.execute(
                     """
-                    SELECT * FROM contacts
-                    WHERE campaign_id = ? AND status = 'pending'
+                    SELECT *
+                    FROM contacts
+                    WHERE campaign_id = ?
+                      AND status = 'pending'
+                      AND phone NOT IN (SELECT phone FROM blacklist)
                     ORDER BY row_index LIMIT 1
                     """,
                     (campaign_id,),
@@ -523,16 +555,25 @@ class Database:
                 if not owner:
                     raise ValueError("Lista nao encontrada.")
 
+                materialized = list(contacts)
+                phones_seen = {item["phone"] for item in materialized if item.get("phone")}
+                blacklisted = self._collect_blacklist_hits(conn, phones_seen)
+
                 added = 0
                 duplicates = 0
                 updated = 0
+                blacklisted_skipped = 0
                 seen = set()
-                for item in contacts:
+                for item in materialized:
                     phone = item.get("phone")
                     if not phone or phone in seen:
-                        duplicates += 1
+                        if phone:
+                            duplicates += 1
                         continue
                     seen.add(phone)
+                    if phone in blacklisted:
+                        blacklisted_skipped += 1
+                        continue
                     name = (item.get("name") or "Cliente").strip()[:120]
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO contact_list_contacts (list_id, name, phone) VALUES (?, ?, ?)",
@@ -566,7 +607,13 @@ class Database:
                     "SELECT COUNT(*) FROM contact_list_contacts WHERE list_id = ?",
                     (list_id,),
                 ).fetchone()[0]
-                return {"added": added, "duplicates": duplicates, "updated": updated, "total": int(total)}
+                return {
+                    "added": added,
+                    "duplicates": duplicates,
+                    "updated": updated,
+                    "blacklisted": blacklisted_skipped,
+                    "total": int(total),
+                }
 
     async def contact_list_contacts(self, list_id: int, vendor_id: int, limit: int = 0):
         async with self._lock:
@@ -589,7 +636,7 @@ class Database:
                     params = (list_id, limit)
                 return conn.execute(sql, params).fetchall()
 
-    async def copy_contact_list_to_campaign(self, list_id: int, vendor_id: int, campaign_id: int, limit: int = 0) -> int:
+    async def copy_contact_list_to_campaign(self, list_id: int, vendor_id: int, campaign_id: int, limit: int = 0) -> dict:
         async with self._lock:
             with self.connect() as conn:
                 owner = conn.execute(
@@ -612,16 +659,20 @@ class Database:
                     """ + (" LIMIT ?" if limit > 0 else ""),
                     (list_id, limit) if limit > 0 else (list_id,),
                 ).fetchall()
+
+                phones = {row["phone"] for row in rows if row["phone"]}
+                blacklisted = self._collect_blacklist_hits(conn, phones)
+                accepted = [(row["name"], row["phone"]) for row in rows if row["phone"] not in blacklisted]
                 conn.executemany(
                     """
                     INSERT OR IGNORE INTO contacts (campaign_id, row_index, name, phone)
                     VALUES (?, ?, ?, ?)
                     """,
-                    [(campaign_id, index, row["name"], row["phone"]) for index, row in enumerate(rows)],
+                    [(campaign_id, index, name, phone) for index, (name, phone) in enumerate(accepted)],
                 )
                 total = conn.execute("SELECT COUNT(*) FROM contacts WHERE campaign_id = ?", (campaign_id,)).fetchone()[0]
                 conn.execute("UPDATE campaigns SET total_contacts = ? WHERE id = ?", (total, campaign_id))
-                return int(total)
+                return {"total": int(total), "blacklisted": len(blacklisted)}
 
     async def create_contact_list_snapshot(self, list_id: int, vendor_id: int, reason: str) -> int:
         async with self._lock:
@@ -785,6 +836,182 @@ class Database:
                                 "DELETE FROM contact_list_snapshots WHERE id = ?",
                                 [(item["id"],) for item in old],
                             )
+
+    async def add_to_blacklist(
+        self,
+        phone: str,
+        reason_code: str,
+        reason_note: Optional[str] = None,
+        source: str = "manual",
+        added_by_user_id: Optional[int] = None,
+        added_by_vendor_id: Optional[int] = None,
+    ) -> dict:
+        """Adiciona um telefone a blacklist global. Idempotente.
+
+        Retorna dict com:
+          - added: True se foi inserido agora, False se ja existia
+          - phone: telefone normalizado
+          - removed_pending: contagem de contatos removidos das filas de campanhas em andamento
+        """
+        clean = (phone or "").strip()
+        if not clean:
+            raise ValueError("Telefone vazio.")
+        clean_note = (reason_note or "").strip()[:500] or None
+        async with self._lock:
+            with self.connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO blacklist
+                        (phone, reason_code, reason_note, source, added_by_user_id, added_by_vendor_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (clean, reason_code, clean_note, source, added_by_user_id, added_by_vendor_id),
+                )
+                added = cur.rowcount > 0
+                removed_pending = 0
+                if added:
+                    removed_pending = self._purge_phone_from_active_queues(conn, clean)
+                return {"added": added, "phone": clean, "removed_pending": removed_pending}
+
+    async def remove_from_blacklist(self, phone: str) -> bool:
+        clean = (phone or "").strip()
+        if not clean:
+            return False
+        async with self._lock:
+            with self.connect() as conn:
+                cur = conn.execute("DELETE FROM blacklist WHERE phone = ?", (clean,))
+                return cur.rowcount > 0
+
+    async def is_phone_blacklisted(self, phone: str) -> bool:
+        clean = (phone or "").strip()
+        if not clean:
+            return False
+        async with self._lock:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM blacklist WHERE phone = ? LIMIT 1",
+                    (clean,),
+                ).fetchone()
+                return row is not None
+
+    async def get_blacklist_entry(self, phone: str) -> Optional[sqlite3.Row]:
+        clean = (phone or "").strip()
+        if not clean:
+            return None
+        async with self._lock:
+            with self.connect() as conn:
+                return conn.execute(
+                    "SELECT * FROM blacklist WHERE phone = ?",
+                    (clean,),
+                ).fetchone()
+
+    async def filter_blacklisted(self, phones: Iterable[str]) -> set[str]:
+        """Devolve o subconjunto dos telefones que estao na blacklist."""
+        unique = sorted({p for p in (phones or []) if p})
+        if not unique:
+            return set()
+        async with self._lock:
+            with self.connect() as conn:
+                hits: set[str] = set()
+                for chunk_start in range(0, len(unique), 500):
+                    chunk = unique[chunk_start : chunk_start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"SELECT phone FROM blacklist WHERE phone IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                    for row in rows:
+                        hits.add(row["phone"])
+                return hits
+
+    async def list_blacklist(self, offset: int = 0, limit: int = 20) -> dict:
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 200))
+        async with self._lock:
+            with self.connect() as conn:
+                total = int(conn.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0])
+                rows = conn.execute(
+                    """
+                    SELECT id, phone, reason_code, reason_note, source, added_at,
+                           added_by_user_id, added_by_vendor_id
+                    FROM blacklist
+                    ORDER BY added_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+                return {"total": total, "rows": rows, "offset": offset, "limit": limit}
+
+    async def last_processed_contact_for_campaign(self, campaign_id: int) -> Optional[sqlite3.Row]:
+        """Retorna o ultimo contato que ja foi processado (sent/failed) na campanha."""
+        async with self._lock:
+            with self.connect() as conn:
+                return conn.execute(
+                    """
+                    SELECT id, name, phone, status, error, row_index
+                    FROM contacts
+                    WHERE campaign_id = ? AND status IN ('sent', 'failed')
+                    ORDER BY row_index DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (campaign_id,),
+                ).fetchone()
+
+    def _purge_phone_from_active_queues(self, conn: sqlite3.Connection, phone: str) -> int:
+        """Remove o telefone das filas pendentes de campanhas em andamento.
+
+        Retorna a quantidade de linhas afetadas. Atualiza tambem os contadores das
+        campanhas tocadas para que `total_contacts` reflita a fila real.
+        """
+        affected_campaigns = conn.execute(
+            """
+            SELECT DISTINCT contacts.campaign_id
+            FROM contacts
+            JOIN campaigns ON campaigns.id = contacts.campaign_id
+            WHERE contacts.phone = ?
+              AND contacts.status = 'pending'
+              AND campaigns.status IN ('draft', 'ready', 'running', 'paused')
+            """,
+            (phone,),
+        ).fetchall()
+
+        if not affected_campaigns:
+            return 0
+
+        cur = conn.execute(
+            """
+            DELETE FROM contacts
+            WHERE phone = ?
+              AND status = 'pending'
+              AND campaign_id IN (
+                  SELECT id FROM campaigns
+                  WHERE status IN ('draft', 'ready', 'running', 'paused')
+              )
+            """,
+            (phone,),
+        )
+        affected_rows = cur.rowcount
+
+        for row in affected_campaigns:
+            self._refresh_campaign_counter(conn, int(row["campaign_id"]))
+
+        return int(affected_rows)
+    def _collect_blacklist_hits(self, conn: sqlite3.Connection, phones: Iterable[str]) -> set[str]:
+        """Versao sincrona de filter_blacklisted, para usar dentro de uma transacao aberta."""
+        unique = sorted({p for p in (phones or []) if p})
+        if not unique:
+            return set()
+        hits: set[str] = set()
+        for chunk_start in range(0, len(unique), 500):
+            chunk = unique[chunk_start : chunk_start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT phone FROM blacklist WHERE phone IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                hits.add(row["phone"])
+        return hits
 
     def _cleanup_orphan_records(self, conn: sqlite3.Connection):
         conn.execute(

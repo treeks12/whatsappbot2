@@ -28,8 +28,12 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 - `/disparar`: inicia a campanha pronta.
 - `/status`: mostra ultimas campanhas e progresso.
 - `/cancelar`: cancela a campanha ativa da vendedora.
+- `/blacklist <numero> [motivo]`: bloqueia o telefone; ele nunca mais entra em listas nem campanhas.
+- `/blacklist_remover <numero>`: tira o telefone da blacklist.
+- `/blacklist_listar`: mostra os telefones bloqueados, com botoes para paginar.
+- `/blacklist_arquivo`: importa varios telefones de uma vez via .csv, .vcf, .zip ou contatos do Telegram.
 
-Durante o disparo, a mensagem de progresso tem botoes inline para pausar, retomar e cancelar com confirmacao.
+Durante o disparo, a mensagem de progresso tem botoes inline para pausar, retomar, cancelar com confirmacao e adicionar o ultimo destinatario a blacklist.
 
 ## Perfis
 

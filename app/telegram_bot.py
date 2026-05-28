@@ -38,8 +38,10 @@ logger = logging.getLogger(__name__)
     WAITING_LIST_CONTACTS,
     WAITING_REMOVE_CONTACTS,
     WAITING_RENAME_LIST,
-) = range(8)
+    WAITING_BLACKLIST_FILE,
+) = range(9)
 PERM_STATE_KEY = "perm_state"
+BLACKLIST_PAGE_SIZE = 15
 
 
 def register_handlers(application):
@@ -49,6 +51,9 @@ def register_handlers(application):
     application.add_handler(CommandHandler("desconectar", desconectar))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("disparar", disparar))
+    application.add_handler(CommandHandler("blacklist", blacklist_add))
+    application.add_handler(CommandHandler("blacklist_remover", blacklist_remove))
+    application.add_handler(CommandHandler("blacklist_listar", blacklist_list))
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="If 'per_message=False'.*", category=PTBUserWarning)
@@ -95,6 +100,20 @@ def register_handlers(application):
                     ],
                 },
                 fallbacks=[CommandHandler("cancelar", cancelar)],
+                allow_reentry=True,
+            )
+        )
+        application.add_handler(
+            ConversationHandler(
+                entry_points=[CommandHandler("blacklist_arquivo", blacklist_file_start)],
+                states={
+                    WAITING_BLACKLIST_FILE: [
+                        MessageHandler(filters.Document.ALL, blacklist_file_receive_document),
+                        MessageHandler(filters.CONTACT, blacklist_file_receive_contact),
+                        CommandHandler("pronto", blacklist_file_done),
+                    ],
+                },
+                fallbacks=[CommandHandler("cancelar", blacklist_file_cancel)],
                 allow_reentry=True,
             )
         )
@@ -148,7 +167,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/listas - gerenciar listas de contatos\n"
             "/disparar - iniciar campanha pronta\n"
             "/status - ver ultimas campanhas\n"
-            "/cancelar - cancelar campanha ativa"
+            "/cancelar - cancelar campanha ativa\n"
+            "/blacklist - bloquear telefone para nunca mais receber\n"
+            "/blacklist_remover - remover telefone da blacklist\n"
+            "/blacklist_listar - ver os telefones bloqueados\n"
+            "/blacklist_arquivo - importar varios telefones para a blacklist"
         )
         return
 
@@ -640,11 +663,14 @@ async def create_campaign_from_list(query, context: ContextTypes.DEFAULT_TYPE, l
         await query.edit_message_text("A lista nao tem contatos validos.")
         return
     campaign_id = await db.create_campaign(query.from_user.id, profile.id)
-    total = await db.copy_contact_list_to_campaign(list_id, query.from_user.id, campaign_id, limit)
+    result = await db.copy_contact_list_to_campaign(list_id, query.from_user.id, campaign_id, limit)
     context.user_data["campaign_id"] = campaign_id
     campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
+    extra = ""
+    if result["blacklisted"]:
+        extra = f"\nIgnorados por estarem na blacklist: {result['blacklisted']}."
     await query.edit_message_text(
-        f"Campanha #{campaign_id} criada com {total} contatos.\n"
+        f"Campanha #{campaign_id} criada com {result['total']} contatos.{extra}\n"
         "Agora envie imagens, uma por vez, ou use /sem_midia. Quando terminar, use /pronto."
     )
 
@@ -871,13 +897,16 @@ def contacts_from_telegram_contact(update: Update) -> list[dict]:
 
 
 def import_summary(result: dict) -> str:
-    return (
-        "Lista atualizada.\n"
-        f"Novos: {result['added']}\n"
-        f"Duplicados ignorados: {result['duplicates']}\n"
-        f"Nomes atualizados: {result['updated']}\n"
-        f"Total da lista: {result['total']}"
-    )
+    lines = [
+        "Lista atualizada.",
+        f"Novos: {result['added']}",
+        f"Duplicados ignorados: {result['duplicates']}",
+        f"Nomes atualizados: {result['updated']}",
+    ]
+    if result.get("blacklisted"):
+        lines.append(f"Ignorados por estarem na blacklist: {result['blacklisted']}")
+    lines.append(f"Total da lista: {result['total']}")
+    return "\n".join(lines)
 
 
 async def receive_contacts_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -906,8 +935,11 @@ async def receive_contacts_file(update: Update, context: ContextTypes.DEFAULT_TY
         return WAITING_CSV
 
     total = await db.add_contacts(campaign_id, contacts)
+    extra = ""
+    if total["blacklisted"]:
+        extra = f"\nIgnorados por estarem na blacklist: {total['blacklisted']}."
     await update.message.reply_text(
-        f"Contatos importados: {total}.\n"
+        f"Contatos importados: {total['total']}.{extra}\n"
         "Agora envie imagens, uma por vez, ou use /sem_midia. Quando terminar, use /pronto."
     )
     return WAITING_MEDIA
@@ -947,9 +979,14 @@ async def receive_contact_card(update: Update, context: ContextTypes.DEFAULT_TYP
 
     remaining = contact_limit - (campaign["total_contacts"] if campaign else 0)
     selected = contacts if contact_limit <= 0 else contacts[:remaining]
-    total = await db.add_contacts(campaign_id, selected)
-    extra = "" if len(selected) == len(contacts) else f"\n{len(contacts) - len(selected)} contato(s) excederam o limite e foram ignorados."
-    await update.message.reply_text(f"Contato recebido. Total da campanha: {total}.{extra}\nUse /pronto quando terminar.")
+    result = await db.add_contacts(campaign_id, selected)
+    extra_parts = []
+    if len(selected) != len(contacts):
+        extra_parts.append(f"{len(contacts) - len(selected)} contato(s) excederam o limite e foram ignorados.")
+    if result["blacklisted"]:
+        extra_parts.append(f"Ignorados por estarem na blacklist: {result['blacklisted']}.")
+    extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
+    await update.message.reply_text(f"Contato recebido. Total da campanha: {result['total']}.{extra}\nUse /pronto quando terminar.")
     return WAITING_CSV
 
 
@@ -1145,6 +1182,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_campaign_callback(update, context)
         return
 
+    if data.startswith("bl_"):
+        await handle_blacklist_callback(update, context)
+        return
+
     if data.startswith(("src_", "list_", "menu_")):
         await query.answer("Esse menu expirou. Use /nova ou /listas novamente.", show_alert=True)
         return
@@ -1279,6 +1320,60 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer("Acao desconhecida.", show_alert=True)
 
 
+async def handle_blacklist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    settings, db, _, _ = services(context)
+
+    if data.startswith("bl_page:"):
+        try:
+            offset = max(0, int(data.split(":", 1)[1]))
+        except ValueError:
+            await query.answer("Pagina invalida.", show_alert=True)
+            return
+        await query.answer()
+        text, keyboard = await _render_blacklist_page(db, offset)
+        await safe_edit_query_text(query, text, reply_markup=keyboard)
+        return
+
+    if data.startswith("bl_add_last:"):
+        try:
+            campaign_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Acao invalida.", show_alert=True)
+            return
+
+        campaign = await db.get_campaign(campaign_id)
+        if not campaign:
+            await query.answer("Campanha nao encontrada.", show_alert=True)
+            return
+        if campaign["vendor_id"] != query.from_user.id and not is_authorized(settings, query.from_user.id):
+            await query.answer("Sem permissao.", show_alert=True)
+            return
+
+        last = await db.last_processed_contact_for_campaign(campaign_id)
+        if not last:
+            await query.answer("Ainda nao houve envio nesta campanha.", show_alert=True)
+            return
+
+        result = await db.add_to_blacklist(
+            last["phone"],
+            reason_code="wrong_person",
+            reason_note=f"campanha #{campaign_id}",
+            source="manual",
+            added_by_user_id=query.from_user.id,
+            added_by_vendor_id=campaign["vendor_id"],
+        )
+        if result["added"]:
+            extra = f" e removido de {result['removed_pending']} envio(s) pendente(s)" if result["removed_pending"] else ""
+            await query.answer(f"{last['phone']} adicionado a blacklist{extra}.")
+        else:
+            await query.answer(f"{last['phone']} ja estava na blacklist.")
+        return
+
+    await query.answer("Acao desconhecida.", show_alert=True)
+
+
 async def perm_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(PERM_STATE_KEY) != "waiting_name":
         return
@@ -1310,6 +1405,208 @@ async def perm_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     await update.message.reply_text("Permissão requisitada. Aguarde a aprovação.")
+
+
+# ----------------------------------------------------------------------------
+# Blacklist
+# ----------------------------------------------------------------------------
+
+
+def _format_blacklist_entry(row) -> str:
+    note = row["reason_note"] or ""
+    parts = [f"{row['phone']} ({row['reason_code']}, {row['source']})"]
+    if note:
+        parts.append(f"  motivo: {note}")
+    return "\n".join(parts)
+
+
+async def blacklist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+
+    _, db, _, _ = services(context)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Uso:\n"
+            "/blacklist 5511999998888 motivo opcional\n"
+            "Para importar varios, use /blacklist_arquivo."
+        )
+        return
+
+    phone = usable_phone(args[0])
+    if not phone:
+        await update.message.reply_text(
+            "Telefone invalido. Use o formato com DDD e (preferencialmente) DDI: 5511999998888."
+        )
+        return
+
+    note = " ".join(args[1:]).strip() or None
+    result = await db.add_to_blacklist(
+        phone,
+        reason_code="manual_request",
+        reason_note=note,
+        source="manual",
+        added_by_user_id=update.effective_user.id,
+        added_by_vendor_id=update.effective_user.id,
+    )
+    if result["added"]:
+        msg = f"Telefone {phone} adicionado a blacklist."
+        if result["removed_pending"]:
+            msg += f"\nRemovido de {result['removed_pending']} envio(s) pendente(s) em campanhas em andamento."
+        await update.message.reply_text(msg)
+    else:
+        existing = await db.get_blacklist_entry(phone)
+        if existing:
+            await update.message.reply_text(
+                f"Telefone {phone} ja estava na blacklist.\n"
+                f"  motivo: {existing['reason_note'] or '-'}\n"
+                f"  desde: {existing['added_at']}"
+            )
+        else:
+            await update.message.reply_text(f"Telefone {phone} ja estava na blacklist.")
+
+
+async def blacklist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+
+    _, db, _, _ = services(context)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Uso: /blacklist_remover 5511999998888")
+        return
+
+    phone = usable_phone(args[0])
+    if not phone:
+        await update.message.reply_text(
+            "Telefone invalido. Use o formato com DDD e (preferencialmente) DDI: 5511999998888."
+        )
+        return
+
+    removed = await db.remove_from_blacklist(phone)
+    await update.message.reply_text(
+        f"Telefone {phone} removido da blacklist." if removed else f"Telefone {phone} nao estava na blacklist."
+    )
+
+
+def _blacklist_page_keyboard(offset: int, limit: int, total: int) -> InlineKeyboardMarkup | None:
+    buttons = []
+    if offset > 0:
+        prev_offset = max(0, offset - limit)
+        buttons.append(InlineKeyboardButton("Anterior", callback_data=f"bl_page:{prev_offset}"))
+    if offset + limit < total:
+        next_offset = offset + limit
+        buttons.append(InlineKeyboardButton("Proxima", callback_data=f"bl_page:{next_offset}"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+async def _render_blacklist_page(db: Database, offset: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    page = await db.list_blacklist(offset=offset, limit=BLACKLIST_PAGE_SIZE)
+    if not page["rows"]:
+        return ("Blacklist vazia." if page["total"] == 0 else "Pagina vazia.", None)
+    lines = [
+        f"Blacklist ({page['offset'] + 1}-{page['offset'] + len(page['rows'])} de {page['total']}):",
+        "",
+    ]
+    lines.extend(_format_blacklist_entry(row) for row in page["rows"])
+    keyboard = _blacklist_page_keyboard(page["offset"], page["limit"], page["total"])
+    return ("\n".join(lines), keyboard)
+
+
+async def blacklist_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+    _, db, _, _ = services(context)
+    text, keyboard = await _render_blacklist_page(db, offset=0)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def blacklist_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return ConversationHandler.END
+    context.user_data["blacklist_phones"] = []
+    await update.message.reply_text(
+        "Envie um arquivo .csv, .vcf ou .zip com os telefones a bloquear, ou encaminhe contatos pelo Telegram.\n"
+        "Aceito ate 10000 telefones por importacao.\n"
+        "Use /pronto quando terminar, ou /cancelar para abortar."
+    )
+    return WAITING_BLACKLIST_FILE
+
+
+async def blacklist_file_receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, _, _, _ = services(context)
+    try:
+        contacts = await contacts_from_document(update, context, settings, 10000)
+    except Exception as exc:
+        await update.message.reply_text(str(exc))
+        return WAITING_BLACKLIST_FILE
+    bucket = context.user_data.setdefault("blacklist_phones", [])
+    bucket.extend(item["phone"] for item in contacts)
+    unique_count = len({phone for phone in bucket if phone})
+    await update.message.reply_text(
+        f"Recebidos: {unique_count} telefones unicos ate agora.\nUse /pronto para confirmar ou envie mais."
+    )
+    return WAITING_BLACKLIST_FILE
+
+
+async def blacklist_file_receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contacts = contacts_from_telegram_contact(update)
+    if not contacts:
+        await update.message.reply_text(
+            "Contato sem numero completo. Envie um arquivo com os telefones se o Telegram cortar o DDD."
+        )
+        return WAITING_BLACKLIST_FILE
+    bucket = context.user_data.setdefault("blacklist_phones", [])
+    bucket.extend(item["phone"] for item in contacts)
+    unique_count = len({phone for phone in bucket if phone})
+    await update.message.reply_text(
+        f"Recebidos: {unique_count} telefones unicos ate agora.\nUse /pronto para confirmar ou envie mais."
+    )
+    return WAITING_BLACKLIST_FILE
+
+
+async def blacklist_file_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _, db, _, _ = services(context)
+    phones = list({phone for phone in context.user_data.get("blacklist_phones", []) if phone})
+    context.user_data.pop("blacklist_phones", None)
+    if not phones:
+        await update.message.reply_text("Nenhum telefone valido recebido.")
+        return ConversationHandler.END
+
+    added = 0
+    already = 0
+    purged_total = 0
+    for phone in phones:
+        result = await db.add_to_blacklist(
+            phone,
+            reason_code="imported",
+            reason_note=None,
+            source="imported",
+            added_by_user_id=update.effective_user.id,
+            added_by_vendor_id=update.effective_user.id,
+        )
+        if result["added"]:
+            added += 1
+        else:
+            already += 1
+        purged_total += result["removed_pending"]
+
+    parts = [
+        "Importacao concluida.",
+        f"Adicionados: {added}",
+        f"Ja estavam na blacklist: {already}",
+    ]
+    if purged_total:
+        parts.append(f"Removidos de filas pendentes: {purged_total}")
+    await update.message.reply_text("\n".join(parts))
+    return ConversationHandler.END
+
+
+async def blacklist_file_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("blacklist_phones", None)
+    await update.message.reply_text("Importacao para a blacklist cancelada.")
+    return ConversationHandler.END
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

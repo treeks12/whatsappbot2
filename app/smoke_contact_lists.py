@@ -32,9 +32,10 @@ async def main():
         print(f"import.ok added={imported['added']} incremental_duplicates={duplicate['duplicates']}")
 
         campaign_id = await db.create_campaign(1, "confianca_100")
-        total = await db.copy_contact_list_to_campaign(list_id, 1, campaign_id, 0)
-        assert total == 2, total
-        print(f"campaign_copy.ok total={total}")
+        result = await db.copy_contact_list_to_campaign(list_id, 1, campaign_id, 0)
+        assert result["total"] == 2, result
+        assert result["blacklisted"] == 0, result
+        print(f"campaign_copy.ok total={result['total']}")
 
         snapshot_id = await db.create_contact_list_snapshot(list_id, 1, "antes de reduzir")
         removed = await db.remove_contacts_from_list(list_id, 1, ["5511999999999"])

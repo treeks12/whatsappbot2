@@ -112,12 +112,20 @@ def parse_contacts_vcf_text(content: str) -> list[dict]:
 
         for line in card:
             key, params, value = parse_vcard_line(line)
+            if not key:
+                continue
+            if key.startswith("X-"):
+                # WhatsApp adiciona X-WA-BIZ-NAME, X-ABLABEL e outras extensoes que nao sao TEL.
+                continue
             if key in ("FN", "N"):
                 decoded = decode_vcard_value(value, params)
                 if decoded:
                     name = clean_vcard_name(decoded) or name
             elif key == "TEL":
-                phone = usable_phone(value)
+                # WhatsApp injeta waid=<DDI+DDD+numero> no parametro. Quando presente,
+                # e o identificador canonico e costuma ter DDI mesmo quando o "value"
+                # veio em formato local. Tentamos waid primeiro, depois value.
+                phone = usable_phone(params.get("WAID", "")) or usable_phone(value)
                 if phone:
                     phones.append(phone)
 
@@ -170,13 +178,23 @@ def parse_vcard_line(line: str) -> tuple[str, dict[str, str], str]:
 
     left, value = line.split(":", 1)
     parts = left.split(";")
-    key = parts[0].upper()
+    raw_key = parts[0].upper()
+    # Apple/iOS (e VCF do WhatsApp do iPhone) exporta com prefixo "itemN.KEY".
+    if "." in raw_key:
+        raw_key = raw_key.split(".", 1)[1]
+    key = raw_key
     params = {}
 
     for part in parts[1:]:
         if "=" in part:
             param_key, param_value = part.split("=", 1)
-            params[param_key.upper()] = param_value.upper()
+            normalized_key = param_key.upper()
+            # WAID e digitos puros; uppercasing nao faz sentido. Preserva o valor original
+            # para que usable_phone consiga normalizar igual a um telefone.
+            if normalized_key == "WAID":
+                params[normalized_key] = param_value
+            else:
+                params[normalized_key] = param_value.upper()
         else:
             params[part.upper()] = "TRUE"
 
