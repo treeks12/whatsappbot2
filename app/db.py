@@ -216,6 +216,14 @@ class Database:
             with self.connect() as conn:
                 return conn.execute("SELECT * FROM vendors WHERE telegram_id = ?", (telegram_id,)).fetchone()
 
+    async def list_vendor_instance_names(self) -> list[str]:
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT instance_name FROM vendors WHERE instance_name IS NOT NULL"
+                ).fetchall()
+                return [row["instance_name"] for row in rows]
+
     async def create_campaign(self, vendor_id: int, profile_id: str) -> int:
         async with self._lock:
             with self.connect() as conn:

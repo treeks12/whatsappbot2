@@ -63,10 +63,28 @@ class EvolutionPowerManager:
             return
         if await db.count_running_or_paused_campaigns() > 0:
             return
+        # So e seguro parar se NENHUMA sessao WhatsApp estiver aberta. E se a
+        # API nao responder (container ainda subindo no boot), NAO decidir
+        # parar: melhor deixar ligado do que derrubar sessao viva por dado
+        # ausente (bug: todo restart do bot parava a Evolution mesmo com
+        # WhatsApp conectado).
+        try:
+            await self.evolution.info()
+            if await self._any_open_session(db):
+                return
+        except Exception as exc:
+            logger.warning("Idle-stop adiado (Evolution sem resposta): %s", exc)
+            return
         try:
             await self.stop_container()
         except DockerControlError:
             logger.warning("Nao foi possivel parar Evolution API automaticamente", exc_info=True)
+
+    async def _any_open_session(self, db: Database) -> bool:
+        for instance_name in await db.list_vendor_instance_names():
+            if await self.evolution.connection_state(instance_name) == "open":
+                return True
+        return False
 
     async def _wait_for_api(self, timeout_seconds: int = 90):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
