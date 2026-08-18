@@ -258,6 +258,12 @@ class CampaignScheduler:
                         await self._send_contact(campaign, contact, profile, media_items, media_cache)
                         await self.db.mark_contact_sent(campaign_id, contact["id"], contact["phone"])
                         self.suspicion.decay(instance_name)
+                        # Aparecer offline durante a espera longa entre contatos:
+                        # numero conectado 24h em 'online' e um classico sinal de bot.
+                        try:
+                            await self.evolution.set_presence(instance_name, "unavailable")
+                        except Exception:
+                            logger.debug("Presenca global indisponivel neste build da Evolution")
                         result_line = f"Contato {current_number}/{total} enviado."
                     except Exception as exc:
                         if await self._connection_closed(instance_name):

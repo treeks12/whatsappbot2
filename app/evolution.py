@@ -115,10 +115,10 @@ class EvolutionClient:
 
             return payload
 
-    async def create_instance(self, instance_name: str) -> Dict[str, Any]:
+    async def create_instance(self, instance_name: str, qrcode: bool = True) -> Dict[str, Any]:
         payload = {
             "instanceName": instance_name,
-            "qrcode": True,
+            "qrcode": qrcode,
             "integration": "WHATSAPP-BAILEYS",
         }
         return await self._request("POST", "/instance/create", json=payload)
@@ -142,17 +142,28 @@ class EvolutionClient:
         if await self.connection_state(instance_name) == "open":
             return ""
 
+        # create com qrcode=False: se a instancia nascer com sessao QR pendente,
+        # a Evolution retorna pairingCode=None (confirmado por probe A/B/C).
         try:
-            await self.create_instance(instance_name)
+            await self.create_instance(instance_name, qrcode=False)
         except EvolutionError as exc:
             if not _is_existing_instance_error(exc):
                 raise
 
         payload = await self._request(
             "GET",
-            f"/instance/connect/{instance_name}?number={phone_e164}&qrcode=false",
+            f"/instance/connect/{instance_name}?number={phone_e164}",
         )
         code = str(payload.get("pairingCode") or "").strip()
+        if not code:
+            # Uma sessao QR pendente de tentativa anterior pode segurar o pairing;
+            # uma segunda chamada depois de alguns segundos costuma resolver.
+            await asyncio.sleep(5)
+            payload = await self._request(
+                "GET",
+                f"/instance/connect/{instance_name}?number={phone_e164}",
+            )
+            code = str(payload.get("pairingCode") or "").strip()
         if not code:
             raise EvolutionError(f"Pairing code nao retornado para {instance_name}: {payload}")
         return code
@@ -338,6 +349,19 @@ class EvolutionClient:
             "POST",
             f"/chat/sendPresence/{instance_name}",
             json={"number": normalize_phone(phone), "presence": presence, "delay": delay},
+        )
+
+    async def set_presence(self, instance_name: str, presence: str = "unavailable") -> Dict[str, Any]:
+        """Muda a presenca da conta inteira (best-effort).
+
+        'unavailable' faz o numero aparecer OFFLINE enquanto a sessao esta aberta,
+        em vez de ficar 'online' 24h por causa da maquina. Chamadores devem tolerar
+        falha: nem todo build da Evolution aceita presenca global.
+        """
+        return await self._request(
+            "POST",
+            f"/chat/sendPresence/{instance_name}",
+            json={"presence": presence},
         )
 
     async def send_media(

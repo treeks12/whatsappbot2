@@ -449,6 +449,18 @@ async def start_qr_connect(query, context: ContextTypes.DEFAULT_TYPE):
     _spawn_qr_watch(context, user.id, instance_name, query.message.chat_id)
 
 
+async def _try_appear_offline(evolution: EvolutionClient, instance_name: str):
+    """Best-effort: faz o numero aparecer offline logo apos conectar.
+
+    Sessao aberta != aparecer online; 'unavailable' esconde o online constante
+    da maquina. Se o build da Evolution nao aceitar, segue silenciosamente.
+    """
+    try:
+        await evolution.set_presence(instance_name, "unavailable")
+    except Exception:
+        logger.debug("Presenca global indisponivel para %s", instance_name, exc_info=True)
+
+
 def _cancel_previous_task(context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
     previous = context.application.bot_data.get(key)
     if previous and not previous.done():
@@ -467,6 +479,7 @@ def _spawn_connect_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, insta
             await asyncio.sleep(CONNECT_POLL_SECONDS)
             if await evolution.connection_state(instance_name) == "open":
                 await ensure_instance_webhook(settings, evolution, instance_name)
+                await _try_appear_offline(evolution, instance_name)
                 await context.bot.send_message(
                     chat_id,
                     "✅ WhatsApp conectado com sucesso! Pode criar suas campanhas. 🎉",
@@ -493,6 +506,7 @@ def _spawn_qr_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, instance_n
             await asyncio.sleep(QR_REFRESH_SECONDS)
             if await evolution.connection_state(instance_name) == "open":
                 await ensure_instance_webhook(settings, evolution, instance_name)
+                await _try_appear_offline(evolution, instance_name)
                 await context.bot.send_message(
                     chat_id,
                     "✅ WhatsApp conectado com sucesso! Pode criar suas campanhas. 🎉",
