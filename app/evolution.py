@@ -129,6 +129,24 @@ class EvolutionClient:
     async def connect_instance(self, instance_name: str) -> Dict[str, Any]:
         return await self._request("GET", f"/instance/connect/{instance_name}")
 
+    async def connection_snapshot(self, instance_name: str, phone_e164: str = "") -> Dict[str, Any]:
+        """Foto do estado atual da conexao: QR vigente e pairingCode vigente.
+
+        Enquanto a sessao espera o pareamento, a Evolution renova o QR (e com ele
+        o pairingCode) a cada ciclo de ~20s. Este GET devolve o codigo ATUAL sem
+        criar sessao nova (quando o estado e 'connecting'); se a sessao caiu
+        ('close'), ele re-inicia com o numero informado — exatamente o que queremos.
+        """
+        path = f"/instance/connect/{instance_name}"
+        if phone_e164:
+            path += f"?number={phone_e164}"
+        try:
+            return await self._request("GET", path)
+        except EvolutionError as exc:
+            if "does not exist" in str(exc):
+                return {}
+            raise
+
     async def request_pairing_code(self, instance_name: str, phone_e164: str) -> str:
         """Pede um pairing code (codigo de digitos) para conectar sem escanear QR.
 

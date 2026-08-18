@@ -188,7 +188,6 @@ CONNECT_POLL_SECONDS = 5
 CONNECT_POLL_TIMEOUT = 180
 QR_REFRESH_ATTEMPTS = 3
 QR_REFRESH_SECONDS = 50
-CODE_RENEW_SECONDS = 100
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -297,8 +296,8 @@ def format_phone_br(phone_e164: str) -> str:
 
 def connect_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔢 Conectar com código", callback_data="cconnect_pair")],
-        [InlineKeyboardButton("📷 Conectar com QR Code", callback_data="cconnect_qr")],
+        [InlineKeyboardButton("📷 Conectar com QR Code (recomendado)", callback_data="cconnect_qr")],
+        [InlineKeyboardButton("🔢 Conectar com código (tem que colar rápido)", callback_data="cconnect_pair")],
         [InlineKeyboardButton("✏️ Trocar número", callback_data="cconnect_changephone")],
         back_to_menu_row(),
     ])
@@ -390,8 +389,12 @@ async def receive_connect_phone(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, code: str, phone: str = ""):
-    """Passos no painel (editado) + codigo em mensagem propria, copiavel com um toque."""
+async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, code: str, phone: str = "") -> int | None:
+    """Passos no painel (editado) + codigo em mensagem propria, copiavel com um toque.
+
+    Retorna o id da mensagem do codigo para o watcher mante-la sempre atual
+    (a Evolution renova o codigo a cada ~20s enquanto espera o pareamento).
+    """
     where = f" do número {format_phone_br(phone)}" if phone else ""
     await safe_edit_query_text(
         query,
@@ -400,14 +403,17 @@ async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, 
         "2. Aparelhos conectados\n"
         "3. Conectar um aparelho\n"
         "4. Conectar com número de telefone\n\n"
-        "👉 Copie o código que enviei na próxima mensagem e cole lá.\n"
-        "Se ele expirar, eu mando um novo sozinho.",
+        "👉 Copie o código da próxima mensagem e cole LÁ RÁPIDO.\n"
+        "⚠️ O código muda sozinho a cada ~20s — mas eu atualizo a mensagem com o "
+        "código atual. Se der incorreto, copie o que está na tela de novo.",
     )
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"🔐 Código de conexão (toque e segure para copiar):\n\n`{format_pairing_code(code)}`",
+        text="🔐 Código de conexão (toque e segure para copiar):\n\n"
+        f"`{format_pairing_code(code)}`",
         parse_mode="Markdown",
     )
+    return message.message_id
 
 
 def _reset_offer_keyboard(mode: str) -> InlineKeyboardMarkup:
@@ -464,7 +470,11 @@ async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str
                     reply_markup=main_menu_keyboard(),
                 )
                 return
-            await _send_pairing_code_message(query, context, await evolution.request_pairing_code(instance_name, phone), phone)
+            code = await evolution.request_pairing_code(instance_name, phone)
+            code_message_id = await _send_pairing_code_message(query, context, code, phone)
+            schedule_idle_stop(context)
+            _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id, code_message_id)
+            return
         else:
             qr_base64 = await evolution.ensure_fresh_qr(instance_name)
             image = qr_photo_bytes(qr_base64)
@@ -487,10 +497,6 @@ async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str
             f"⚠️ Falha no reset de conexao\nUsuário: {user.full_name} ({user.id})\n{exc}",
         )
         await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
-        return
-
-    schedule_idle_stop(context)
-    _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id)
 
 
 async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
@@ -527,9 +533,9 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
         return
 
-    await _send_pairing_code_message(query, context, code, phone)
+    code_message_id = await _send_pairing_code_message(query, context, code, phone)
     schedule_idle_stop(context)
-    _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id)
+    _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id, code_message_id)
 
 
 async def start_qr_connect(query, context: ContextTypes.DEFAULT_TYPE):
@@ -591,16 +597,21 @@ def _cancel_previous_task(context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
         previous.cancel()
 
 
-def _spawn_connect_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, instance_name: str, chat_id: int):
+def _spawn_connect_watch(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    instance_name: str,
+    chat_id: int,
+    code_message_id: int | None = None,
+):
     key = f"connect_watch_{user_id}"
     _cancel_previous_task(context, key)
 
     async def watch():
         settings, db, evolution, _ = services(context)
         loop = asyncio.get_running_loop()
-        started = loop.time()
-        last_code_at = started
-        deadline = started + CONNECT_POLL_TIMEOUT
+        deadline = loop.time() + CONNECT_POLL_TIMEOUT
+        shown_code = ""
         while loop.time() < deadline:
             await asyncio.sleep(CONNECT_POLL_SECONDS)
             if await evolution.connection_state(instance_name) == "open":
@@ -612,27 +623,32 @@ def _spawn_connect_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, insta
                     reply_markup=main_menu_keyboard(),
                 )
                 return
-            # Codigo de pareamento expira rapido (~2 min); renovar antes de vencer
-            # para a vendedora nunca digitar um codigo morto.
-            if loop.time() - last_code_at >= CODE_RENEW_SECONDS:
-                last_code_at = loop.time()
+            # A Evolution renova o pairingCode a cada ciclo de QR (~20s); o codigo
+            # antigo morre. Mantemos a mensagem do Telegram sempre com o vigente.
+            if code_message_id:
                 phone = await db.get_vendor_phone(user_id)
                 if not phone:
                     continue
                 try:
-                    code = await evolution.request_pairing_code(instance_name, phone)
+                    snapshot = await evolution.connection_snapshot(instance_name, phone)
                 except Exception:
                     continue
-                if code:
-                    await context.bot.send_message(
-                        chat_id,
-                        "🔄 O código anterior expirou. Novo código:\n\n"
-                        f"`{format_pairing_code(code)}`",
-                        parse_mode="Markdown",
-                    )
+                code = str(snapshot.get("pairingCode") or "").strip()
+                if code and code != shown_code:
+                    shown_code = code
+                    try:
+                        await context.bot.edit_message_text(
+                            "🔐 Código ATUAL (o anterior expirou — copie e cole rápido):\n\n"
+                            f"`{format_pairing_code(code)}`",
+                            chat_id=chat_id,
+                            message_id=code_message_id,
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        logger.debug("Falha ao atualizar mensagem do codigo", exc_info=True)
         await context.bot.send_message(
             chat_id,
-            "⏰ Não conectou a tempo. Toque abaixo para gerar um novo código:",
+            "⏰ Não conectou a tempo. Toque abaixo para tentar de novo:",
             reply_markup=connect_choice_keyboard(),
         )
 
