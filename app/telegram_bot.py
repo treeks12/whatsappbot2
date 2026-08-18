@@ -74,6 +74,7 @@ def register_handlers(application):
                     CallbackQueryHandler(menu_new_entry, pattern="^menu_new$"),
                     CallbackQueryHandler(menu_lists_entry, pattern="^menu_lists$"),
                     CallbackQueryHandler(menu_connect_entry, pattern="^menu_connect$"),
+                    CallbackQueryHandler(changephone_entry, pattern="^cconnect_changephone$"),
                     CallbackQueryHandler(campaign_profile_callback, pattern="^cprof_"),
                     CallbackQueryHandler(draft_continue_entry, pattern="^cdraft_continue_"),
                 ],
@@ -187,6 +188,7 @@ CONNECT_POLL_SECONDS = 5
 CONNECT_POLL_TIMEOUT = 180
 QR_REFRESH_ATTEMPTS = 3
 QR_REFRESH_SECONDS = 50
+CODE_RENEW_SECONDS = 100
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -282,10 +284,22 @@ def format_pairing_code(code: str) -> str:
     return f"{code[:4]}-{code[4:]}" if len(code) > 4 else code
 
 
+def format_phone_br(phone_e164: str) -> str:
+    """5511940069474 -> +55 11 94006-9474 (para a vendedora reconhecer o numero)."""
+    digits = re.sub(r"\D", "", phone_e164 or "")
+    if len(digits) >= 12:
+        ddi, ddd, rest = digits[:2], digits[2:4], digits[4:]
+        tail = f"{rest[-4:]}" if len(rest) > 4 else rest
+        head = rest[:-4] if len(rest) > 4 else ""
+        return f"+{ddi} {ddd} {head}-{tail}"
+    return phone_e164
+
+
 def connect_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔢 Conectar com código", callback_data="cconnect_pair")],
         [InlineKeyboardButton("📷 Conectar com QR Code", callback_data="cconnect_qr")],
+        [InlineKeyboardButton("✏️ Trocar número", callback_data="cconnect_changephone")],
         back_to_menu_row(),
     ])
 
@@ -344,6 +358,19 @@ async def menu_connect_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return WAITING_CONNECT_PHONE
 
 
+async def changephone_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+    await safe_edit_query_text(
+        query,
+        "Qual o número de WhatsApp que você usa para atender clientes?\n\n"
+        "Envie só o número com DDD. Exemplo: 11999998888",
+    )
+    return WAITING_CONNECT_PHONE
+
+
 async def receive_connect_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings, db, _, _ = services(context)
     digits = re.sub(r"\D", "", update.message.text or "")
@@ -363,17 +390,23 @@ async def receive_connect_phone(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-async def _send_pairing_code_message(query, code: str):
+async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, code: str, phone: str = ""):
+    """Passos no painel (editado) + codigo em mensagem propria, copiavel com um toque."""
+    where = f" do número {format_phone_br(phone)}" if phone else ""
     await safe_edit_query_text(
         query,
-        f"🔢 Seu código de conexão:\n\n        {format_pairing_code(code)}\n\n"
-        "No celular, abra o WhatsApp e toque:\n"
+        f"No celular, abra o WhatsApp{where} e toque:\n"
         "1. Configurações (a engrenagem ⚙️)\n"
         "2. Aparelhos conectados\n"
         "3. Conectar um aparelho\n"
-        "4. Conectar com número de telefone\n"
-        "5. Digite o código acima\n\n"
-        "O código expira em poucos minutos. Eu aviso aqui quando conectar. 😉",
+        "4. Conectar com número de telefone\n\n"
+        "👉 Copie o código que enviei na próxima mensagem e cole lá.\n"
+        "Se ele expirar, eu mando um novo sozinho.",
+    )
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"🔐 Código de conexão (toque e segure para copiar):\n\n`{format_pairing_code(code)}`",
+        parse_mode="Markdown",
     )
 
 
@@ -431,7 +464,7 @@ async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str
                     reply_markup=main_menu_keyboard(),
                 )
                 return
-            await _send_pairing_code_message(query, await evolution.request_pairing_code(instance_name, phone))
+            await _send_pairing_code_message(query, context, await evolution.request_pairing_code(instance_name, phone), phone)
         else:
             qr_base64 = await evolution.ensure_fresh_qr(instance_name)
             image = qr_photo_bytes(qr_base64)
@@ -494,7 +527,7 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
         return
 
-    await _send_pairing_code_message(query, code)
+    await _send_pairing_code_message(query, context, code, phone)
     schedule_idle_stop(context)
     _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id)
 
@@ -565,7 +598,9 @@ def _spawn_connect_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, insta
     async def watch():
         settings, db, evolution, _ = services(context)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + CONNECT_POLL_TIMEOUT
+        started = loop.time()
+        last_code_at = started
+        deadline = started + CONNECT_POLL_TIMEOUT
         while loop.time() < deadline:
             await asyncio.sleep(CONNECT_POLL_SECONDS)
             if await evolution.connection_state(instance_name) == "open":
@@ -577,9 +612,27 @@ def _spawn_connect_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, insta
                     reply_markup=main_menu_keyboard(),
                 )
                 return
+            # Codigo de pareamento expira rapido (~2 min); renovar antes de vencer
+            # para a vendedora nunca digitar um codigo morto.
+            if loop.time() - last_code_at >= CODE_RENEW_SECONDS:
+                last_code_at = loop.time()
+                phone = await db.get_vendor_phone(user_id)
+                if not phone:
+                    continue
+                try:
+                    code = await evolution.request_pairing_code(instance_name, phone)
+                except Exception:
+                    continue
+                if code:
+                    await context.bot.send_message(
+                        chat_id,
+                        "🔄 O código anterior expirou. Novo código:\n\n"
+                        f"`{format_pairing_code(code)}`",
+                        parse_mode="Markdown",
+                    )
         await context.bot.send_message(
             chat_id,
-            "⏰ O código expirou sem conexão. Gere um novo quando quiser:",
+            "⏰ Não conectou a tempo. Toque abaixo para gerar um novo código:",
             reply_markup=connect_choice_keyboard(),
         )
 
@@ -784,6 +837,8 @@ async def draft_continue_entry(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data["campaign_id"] = campaign_id
     context.user_data["pending_campaign_profile_id"] = campaign["profile_id"]
+    context.user_data.pop("media_status_msg", None)
+    context.user_data.pop("import_status_msg", None)
     campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
 
     if (campaign["total_contacts"] or 0) <= 0:
@@ -1598,15 +1653,19 @@ async def receive_contacts_file(update: Update, context: ContextTypes.DEFAULT_TY
     extra = ""
     if total["blacklisted"]:
         extra = f"\nIgnorados por estarem na blacklist: {total['blacklisted']}."
-    await update.message.reply_text(
+    await upsert_status_message(
+        context,
+        context.user_data,
+        "import_status_msg",
+        update.effective_chat.id,
         f"Contatos importados: {total['total']}.{extra}\n"
-        "Agora envie as fotos da campanha, uma por vez.\n\n"
-        "Sem fotos? Toque no botão abaixo para escrever só o texto.",
+        "Envie mais arquivos se quiser.\n\n"
+        "Quando terminar, toque no botão abaixo.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Continuar sem fotos", callback_data="cmedia_done")],
+            [InlineKeyboardButton("✅ Terminei os contatos", callback_data="ccontacts_done")],
         ]),
     )
-    return WAITING_MEDIA
+    return WAITING_CSV
 
 
 async def receive_contact_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1667,6 +1726,7 @@ async def contacts_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Nenhum contato valido importado ainda.")
         return WAITING_CSV
 
+    context.user_data.pop("import_status_msg", None)
     await message.reply_text(
         f"Contatos confirmados: {campaign['total_contacts']}. ✅\n"
         "Agora envie as fotos, uma por vez.\n\n"
@@ -1704,7 +1764,12 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = campaign_dir(settings, campaign_id) / file_name
     await file.download_to_drive(path)
     await db.add_media(campaign_id, str(path), "image/jpeg", file_name)
-    await update.message.reply_text(
+    context.user_data.pop("import_status_msg", None)
+    await upsert_status_message(
+        context,
+        context.user_data,
+        "media_status_msg",
+        update.effective_chat.id,
         f"Imagem {count + 1} recebida. ✅ Envie outra ou toque no botão para continuar.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Continuar", callback_data="cmedia_done")],
@@ -1734,7 +1799,12 @@ async def receive_image_document(update: Update, context: ContextTypes.DEFAULT_T
     file = await context.bot.get_file(document.file_id)
     await file.download_to_drive(path)
     await db.add_media(campaign_id, str(path), mime_from_name(file_name), file_name)
-    await update.message.reply_text(
+    context.user_data.pop("import_status_msg", None)
+    await upsert_status_message(
+        context,
+        context.user_data,
+        "media_status_msg",
+        update.effective_chat.id,
         f"Imagem {count + 1} recebida. ✅ Envie outra ou toque no botão para continuar.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Continuar", callback_data="cmedia_done")],
@@ -1750,6 +1820,8 @@ def media_size_allowed(file_size: int | None, max_mb: int) -> bool:
 
 
 async def media_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("media_status_msg", None)
+    context.user_data.pop("import_status_msg", None)
     await update.effective_message.reply_text(
         "Agora escreva a mensagem que vai junto das fotos. 💬\n\n"
         "Só as fotos, sem texto? Toque no botão abaixo.",
@@ -2657,6 +2729,31 @@ async def safe_edit_query_text(query, text: str, reply_markup=None):
         if "Message is not modified" in str(exc):
             return
         raise
+
+
+async def upsert_status_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_data: dict,
+    key: str,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+):
+    """Uma unica mensagem de status por etapa: edita a existente em vez de
+    multiplicar mensagens novas no chat a cada foto/arquivo recebido."""
+    message_id = user_data.get(key)
+    if message_id:
+        try:
+            await context.bot.edit_message_text(
+                text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup
+            )
+            return
+        except BadRequest:
+            pass
+        except Exception:
+            logger.debug("Falha ao editar status, enviando mensagem nova", exc_info=True)
+    message = await context.bot.send_message(chat_id, text, reply_markup=reply_markup)
+    user_data[key] = message.message_id
 
 
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:
