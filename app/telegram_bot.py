@@ -409,9 +409,8 @@ async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, 
     await safe_edit_query_text(
         query,
         f"No celular, abra o WhatsApp{where}: Configurações ⚙️ → Aparelhos conectados → Conectar um aparelho → Conectar com número de telefone.\n\n"
-        "👉 Copie o código da mensagem abaixo quando o WhatsApp pedir.\n"
-        "⏱️ O código fica O MESMO por 3 minutos — pode fazer com calma.\n"
-        f"📱 Se o WhatsApp pedir o número, digite o seu: {format_phone_br(phone) if phone else 'o número da conta'}.",
+        "⌨️ Na tela que abrir, DIGITE O CÓDIGO de 8 caracteres da mensagem abaixo.\n"
+        "⏱️ O código fica O MESMO por 3 minutos — pode fazer com calma.",
     )
     message = await context.bot.send_message(
         chat_id=query.message.chat_id,

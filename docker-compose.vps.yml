@@ -56,10 +56,9 @@ services:
       - CONFIG_SESSION_PHONE_CLIENT=Evolution API VPS
       - CONFIG_SESSION_PHONE_NAME=Chrome
       - QRCODE_LIMIT=30
-      # DEBUG TEMPORARIO p/ diagnosticar pairing (REVERTER depois da coleta)
-      - LOG_LEVEL=DEBUG
+      - LOG_LEVEL=INFO
       - LOG_COLOR=true
-      - LOG_BAILEYS=debug
+      - LOG_BAILEYS=info
       - STORAGE_PROVIDER=local
       - STORAGE_LOCAL_PATH=/evolution/store
       - DATABASE_ENABLED=true
