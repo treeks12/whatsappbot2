@@ -29,6 +29,7 @@ async def post_init(application: Application):
     db = application.bot_data["db"]
     evolution = application.bot_data["evolution"]
     power = application.bot_data["power"]
+    scheduler = application.bot_data["scheduler"]
     webhook_server = application.bot_data.get("webhook_server")
     settings.campaigns_dir.mkdir(parents=True, exist_ok=True)
     try:
