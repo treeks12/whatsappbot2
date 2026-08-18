@@ -18,7 +18,11 @@ services:
       - bot-net
 
   evolution-api:
-    image: evoapicloud/evolution-api:2.4.0-rc2
+    # Imagem derivada da 2.4.0-rc2 com patch de pairingCode estavel
+    # (senao cada ciclo de QR mata o codigo pendente -> "codigo incorreto").
+    build:
+      context: ./evolution-patch
+    image: whatsappbot2-evolution-api:2.4.0-rc2-pairing
     container_name: evolution-api
     ports:
       # 8082 no host: o 8080 ja e usado por outro servico nesta VPS.

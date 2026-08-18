@@ -402,19 +402,16 @@ async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, 
     """Passos no painel (editado) + codigo em mensagem propria, copiavel com um toque.
 
     Retorna o id da mensagem do codigo para o watcher mante-la sempre atual
-    (a Evolution renova o codigo a cada ~20s enquanto espera o pareamento).
+    (com o patch da imagem Evolution o codigo fica estavel durante a janela;
+    o watcher so atualiza se algum build sem patch regenerar o codigo).
     """
     where = f" do número {format_phone_br(phone)}" if phone else ""
     await safe_edit_query_text(
         query,
-        f"No celular, abra o WhatsApp{where} e toque:\n"
-        "1. Configurações (a engrenagem ⚙️)\n"
-        "2. Aparelhos conectados\n"
-        "3. Conectar um aparelho\n"
-        "4. Conectar com número de telefone\n\n"
-        "👉 Copie o código da próxima mensagem e cole LÁ RÁPIDO.\n"
-        "⚠️ O código muda sozinho a cada ~20s — mas eu atualizo a mensagem com o "
-        "código atual. Se der incorreto, copie o que está na tela de novo.",
+        f"No celular, abra o WhatsApp{where}: Configurações ⚙️ → Aparelhos conectados → Conectar um aparelho → Conectar com número de telefone.\n\n"
+        "👉 Copie o código da mensagem abaixo quando o WhatsApp pedir.\n"
+        "⏱️ O código fica O MESMO por 3 minutos — pode fazer com calma.\n"
+        f"📱 Se o WhatsApp pedir o número, digite o seu: {format_phone_br(phone) if phone else 'o número da conta'}.",
     )
     message = await context.bot.send_message(
         chat_id=query.message.chat_id,
@@ -655,8 +652,9 @@ def _spawn_connect_watch(
                     reply_markup=main_menu_keyboard(),
                 )
                 return
-            # A Evolution renova o pairingCode a cada ciclo de QR (~20s); o codigo
-            # antigo morre. Mantemos a mensagem do Telegram sempre com o vigente.
+            # Com o patch da imagem Evolution o codigo NAO muda mais durante a janela;
+            # se esta branch disparar, a imagem esta sem patch e o codigo girou —
+            # mantemos a mensagem sempre com o vigente (auto-cura).
             if code_message_id:
                 phone = await db.get_vendor_phone(user_id)
                 if not phone:
