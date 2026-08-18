@@ -299,10 +299,8 @@ def format_phone_br(phone_e164: str) -> str:
 
 
 def connect_choice_keyboard() -> InlineKeyboardMarkup:
-    # Pairing code removido: nesta build (Evolution rc2 + Baileys 7.0.0-rc.6 patcheado)
-    # o codigo nasce morto ou aponta pra sessao errada (bug conhecido do upstream).
-    # QR e o caminho comprovado; botoes extras so confundem a vendedora.
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Conectar com código", callback_data="cconnect_pair")],
         [InlineKeyboardButton("📷 Conectar com QR Code", callback_data="cconnect_qr")],
         [InlineKeyboardButton("✏️ Trocar número", callback_data="cconnect_changephone")],
         back_to_menu_row(),
@@ -424,6 +422,7 @@ async def _send_pairing_code_message(query, context: ContextTypes.DEFAULT_TYPE, 
         f"`{format_pairing_code(code)}`",
         parse_mode="Markdown",
     )
+    _remember_flow_msg(context, query.message.chat_id, message)
     return message.message_id
 
 
@@ -484,7 +483,7 @@ async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str
             code = await evolution.request_pairing_code(instance_name, phone)
             code_message_id = await _send_pairing_code_message(query, context, code, phone)
             schedule_idle_stop(context)
-            _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id, code_message_id)
+            _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id, code_message_id, code)
             return
         else:
             qr_base64 = await evolution.ensure_fresh_qr(instance_name)
@@ -517,6 +516,7 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
     power = power_service(context)
     user = query.from_user
     instance_name = f"vendor_{user.id}"
+    chat_id = query.message.chat_id
 
     phone = await db.get_vendor_phone(user.id)
     if not phone:
@@ -529,11 +529,25 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await power.ensure_running()
+        if await evolution.connection_state(instance_name) == "open":
+            await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
+            return
+        # Zero absoluto por tentativa: sessao antiga/morta quicando gera codigo
+        # amarrado ao cliente errado ("confira o numero"). Sem sessao aberta nao
+        # ha nada a preservar — apagar e recriar limpo e seguro.
+        try:
+            await evolution.delete_instance(instance_name)
+            await asyncio.sleep(3)
+        except Exception:
+            logger.warning("Falha ao limpar instancia antes do pairing", exc_info=True)
         code = await evolution.request_pairing_code(instance_name, phone)
+        logger.info(
+            "Pairing iniciado para %s (instancia recriada limpa, telefone %s)",
+            instance_name,
+            phone,
+        )
     except Exception as exc:
         logger.exception("Erro ao gerar pairing code")
-        if await _maybe_offer_reset(query, context, exc, "pair"):
-            return
         await notify_admins(
             context,
             f"⚠️ Falha ao gerar pairing code\nUsuário: {user.full_name} ({user.id})\n{exc}",
@@ -547,7 +561,7 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
 
     code_message_id = await _send_pairing_code_message(query, context, code, phone)
     schedule_idle_stop(context)
-    _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id, code_message_id)
+    _spawn_connect_watch(context, user.id, instance_name, chat_id, code_message_id, code)
 
 
 async def start_qr_connect(query, context: ContextTypes.DEFAULT_TYPE):
@@ -618,6 +632,7 @@ def _spawn_connect_watch(
     instance_name: str,
     chat_id: int,
     code_message_id: int | None = None,
+    initial_code: str = "",
 ):
     key = f"connect_watch_{user_id}"
     _cancel_previous_task(context, key)
@@ -626,12 +641,14 @@ def _spawn_connect_watch(
         settings, db, evolution, _ = services(context)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CONNECT_POLL_TIMEOUT
-        shown_code = ""
+        shown_code = initial_code
+        rotations = 0
         while loop.time() < deadline:
             await asyncio.sleep(CONNECT_POLL_SECONDS)
             if await evolution.connection_state(instance_name) == "open":
                 await ensure_instance_webhook(settings, evolution, instance_name)
                 await _try_appear_offline(evolution, instance_name)
+                await _clear_flow_msgs(context, chat_id)
                 await context.bot.send_message(
                     chat_id,
                     "✅ WhatsApp conectado com sucesso! Pode criar suas campanhas. 🎉",
@@ -650,7 +667,13 @@ def _spawn_connect_watch(
                     continue
                 code = str(snapshot.get("pairingCode") or "").strip()
                 if code and code != shown_code:
+                    rotations += 1
                     shown_code = code
+                    logger.info(
+                        "Pairing %s: codigo vigente atualizado (rotacao %d)",
+                        instance_name,
+                        rotations,
+                    )
                     try:
                         await context.bot.edit_message_text(
                             "🔐 Código ATUAL (o anterior expirou — copie e cole rápido):\n\n"
@@ -661,11 +684,13 @@ def _spawn_connect_watch(
                         )
                     except Exception:
                         logger.debug("Falha ao atualizar mensagem do codigo", exc_info=True)
-        await context.bot.send_message(
+        await _clear_flow_msgs(context, chat_id)
+        final = await context.bot.send_message(
             chat_id,
             "⏰ Não conectou a tempo. Toque abaixo para tentar de novo:",
             reply_markup=connect_choice_keyboard(),
         )
+        _remember_flow_msg(context, chat_id, final)
 
     task = context.application.create_task(watch())
     context.application.bot_data[key] = task
