@@ -236,7 +236,10 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data == "menu_main":
         await query.answer()
-        await send_main_menu(query.message)
+        try:
+            await query.edit_message_text("Escolha o que fazer 👇", reply_markup=main_menu_keyboard())
+        except BadRequest:
+            await send_main_menu(query.message)
         return
 
     if data == "menu_status":
@@ -255,7 +258,8 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"parados em {processed}/{row['total_contacts']} | falhas {failed}"
                 )
             text = "\n".join(lines)
-        await query.message.reply_text(text, reply_markup=main_menu_keyboard())
+        status_message = await query.message.reply_text(text)
+        _delete_later(context, status_message.chat_id, status_message, delay=120.0)
         return
 
     if data == "menu_blacklist":
@@ -295,9 +299,11 @@ def format_phone_br(phone_e164: str) -> str:
 
 
 def connect_choice_keyboard() -> InlineKeyboardMarkup:
+    # Pairing code removido: nesta build (Evolution rc2 + Baileys 7.0.0-rc.6 patcheado)
+    # o codigo nasce morto ou aponta pra sessao errada (bug conhecido do upstream).
+    # QR e o caminho comprovado; botoes extras so confundem a vendedora.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📷 Conectar com QR Code (recomendado)", callback_data="cconnect_qr")],
-        [InlineKeyboardButton("🔢 Conectar com código (tem que colar rápido)", callback_data="cconnect_pair")],
+        [InlineKeyboardButton("📷 Conectar com QR Code", callback_data="cconnect_qr")],
         [InlineKeyboardButton("✏️ Trocar número", callback_data="cconnect_changephone")],
         back_to_menu_row(),
     ])
@@ -314,6 +320,11 @@ async def menu_connect_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = query.from_user
     instance_name = f"vendor_{user.id}"
     await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
+
+    # Lixo de tentativas anteriores some sozinho: sobra so o painel atual.
+    chat_id = query.message.chat_id
+    await _clear_flow_msgs(context, chat_id, keep=query.message.message_id)
+    _remember_flow_msg(context, chat_id, query.message)
 
     try:
         await power.ensure_running()
@@ -480,13 +491,14 @@ async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str
             image = qr_photo_bytes(qr_base64)
             if not image:
                 raise EvolutionError("QR nao retornado apos reset")
-            await query.message.reply_photo(
-                photo=io.BytesIO(image),
-                caption=(
-                    "Escaneie no WhatsApp: Configurações > Aparelhos conectados > Conectar aparelho.\n\n"
-                    "Não deu tempo? Eu mando um QR novo automaticamente. 😉"
-                ),
+            await safe_edit_query_text(
+                query,
+                "Escaneie o QR que enviei:\n\n"
+                "No WhatsApp: Configurações > Aparelhos conectados > Conectar aparelho.\n"
+                "Não deu tempo? Eu mando um QR novo sozinho. 😉",
             )
+            qr_message = await query.message.reply_photo(photo=io.BytesIO(image))
+            _remember_flow_msg(context, qr_message.chat_id, qr_message)
             schedule_idle_stop(context)
             _spawn_qr_watch(context, user.id, instance_name, query.message.chat_id)
             return
@@ -568,13 +580,16 @@ async def start_qr_connect(query, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
         return
 
-    await query.message.reply_photo(
-        photo=io.BytesIO(image),
-        caption=(
-            "Escaneie no WhatsApp: Configurações > Aparelhos conectados > Conectar aparelho.\n\n"
-            "Não deu tempo? Eu mando um QR novo automaticamente. 😉"
-        ),
+    phone = await db.get_vendor_phone(user.id)
+    where = f" do número {format_phone_br(phone)}" if phone else ""
+    await safe_edit_query_text(
+        query,
+        f"Escaneie o QR que enviei{where}:\n\n"
+        "No WhatsApp: Configurações > Aparelhos conectados > Conectar aparelho.\n"
+        "Não deu tempo? Eu mando um QR novo sozinho. 😉",
     )
+    qr_message = await query.message.reply_photo(photo=io.BytesIO(image))
+    _remember_flow_msg(context, qr_message.chat_id, qr_message)
     schedule_idle_stop(context)
     _spawn_qr_watch(context, user.id, instance_name, query.message.chat_id)
 
@@ -667,6 +682,7 @@ def _spawn_qr_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, instance_n
             if await evolution.connection_state(instance_name) == "open":
                 await ensure_instance_webhook(settings, evolution, instance_name)
                 await _try_appear_offline(evolution, instance_name)
+                await _clear_flow_msgs(context, chat_id)
                 await context.bot.send_message(
                     chat_id,
                     "✅ WhatsApp conectado com sucesso! Pode criar suas campanhas. 🎉",
@@ -680,19 +696,23 @@ def _spawn_qr_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, instance_n
                 continue
             image = qr_photo_bytes(qr_base64)
             if image:
-                await context.bot.send_photo(
+                msg = await context.bot.send_photo(
                     chat_id,
                     photo=io.BytesIO(image),
-                    caption=f"🔄 QR atualizado ({attempt + 2}/{QR_REFRESH_ATTEMPTS}). O anterior expirou.",
+                    caption=f"🔄 QR novo ({attempt + 2}/{QR_REFRESH_ATTEMPTS}) — o anterior expirou.",
                 )
+                _remember_flow_msg(context, chat_id, msg)
         if await evolution.connection_state(instance_name) == "open":
+            await _clear_flow_msgs(context, chat_id)
             await context.bot.send_message(chat_id, "✅ WhatsApp conectado! 🎉")
             return
-        await context.bot.send_message(
+        await _clear_flow_msgs(context, chat_id)
+        final = await context.bot.send_message(
             chat_id,
             "⏰ Os QR Codes expiraram sem conexão. Toque abaixo para tentar de novo:",
             reply_markup=connect_choice_keyboard(),
         )
+        _remember_flow_msg(context, chat_id, final)
 
     task = context.application.create_task(watch())
     context.application.bot_data[key] = task
@@ -853,8 +873,7 @@ async def draft_continue_entry(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data["campaign_id"] = campaign_id
     context.user_data["pending_campaign_profile_id"] = campaign["profile_id"]
-    context.user_data.pop("media_status_msg", None)
-    context.user_data.pop("import_status_msg", None)
+    _discard_status_messages(context, context.user_data, query.message.chat_id, "media_status_msg", "import_status_msg")
     campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
 
     if (campaign["total_contacts"] or 0) <= 0:
@@ -1742,7 +1761,7 @@ async def contacts_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Nenhum contato valido importado ainda.")
         return WAITING_CSV
 
-    context.user_data.pop("import_status_msg", None)
+    _discard_status_messages(context, context.user_data, message.chat_id, "import_status_msg")
     await message.reply_text(
         f"Contatos confirmados: {campaign['total_contacts']}. ✅\n"
         "Agora envie as fotos, uma por vez.\n\n"
@@ -1780,7 +1799,7 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = campaign_dir(settings, campaign_id) / file_name
     await file.download_to_drive(path)
     await db.add_media(campaign_id, str(path), "image/jpeg", file_name)
-    context.user_data.pop("import_status_msg", None)
+    _discard_status_messages(context, context.user_data, update.effective_chat.id, "import_status_msg")
     await upsert_status_message(
         context,
         context.user_data,
@@ -1815,7 +1834,7 @@ async def receive_image_document(update: Update, context: ContextTypes.DEFAULT_T
     file = await context.bot.get_file(document.file_id)
     await file.download_to_drive(path)
     await db.add_media(campaign_id, str(path), mime_from_name(file_name), file_name)
-    context.user_data.pop("import_status_msg", None)
+    _discard_status_messages(context, context.user_data, update.effective_chat.id, "import_status_msg")
     await upsert_status_message(
         context,
         context.user_data,
@@ -1836,8 +1855,7 @@ def media_size_allowed(file_size: int | None, max_mb: int) -> bool:
 
 
 async def media_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("media_status_msg", None)
-    context.user_data.pop("import_status_msg", None)
+    _discard_status_messages(context, context.user_data, update.effective_chat.id, "media_status_msg", "import_status_msg")
     await update.effective_message.reply_text(
         "Agora escreva a mensagem que vai junto das fotos. 💬\n\n"
         "Só as fotos, sem texto? Toque no botão abaixo.",
@@ -2770,6 +2788,58 @@ async def upsert_status_message(
             logger.debug("Falha ao editar status, enviando mensagem nova", exc_info=True)
     message = await context.bot.send_message(chat_id, text, reply_markup=reply_markup)
     user_data[key] = message.message_id
+
+
+# ----------------------------------------------------------------------------
+# Auto-limpeza: mensagens transitórias somem sozinhas
+# ----------------------------------------------------------------------------
+
+
+def _remember_flow_msg(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message) -> None:
+    """Registra mensagem do fluxo de conexao para apagar quando o fluxo avançar."""
+    message_id = getattr(message, "message_id", message)
+    if not message_id:
+        return
+    ids = context.application.bot_data.setdefault(f"flow_msgs_{chat_id}", [])
+    if message_id not in ids:
+        ids.append(message_id)
+
+
+async def _clear_flow_msgs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, keep=None) -> None:
+    """Apaga as mensagens do fluxo registradas para este chat (o lixo some sozinho)."""
+    ids = context.application.bot_data.get(f"flow_msgs_{chat_id}", [])
+    for message_id in list(ids):
+        if message_id == keep:
+            continue
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+    context.application.bot_data[f"flow_msgs_{chat_id}"] = [keep] if keep else []
+
+
+def _delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message, delay: float = 30.0) -> None:
+    """Mensagem com prazo de validade: apaga-se sozinha apos o delay."""
+    message_id = getattr(message, "message_id", message)
+    if not message_id:
+        return
+
+    async def _expire():
+        await asyncio.sleep(delay)
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
+    context.application.create_task(_expire())
+
+
+def _discard_status_messages(context: ContextTypes.DEFAULT_TYPE, user_data: dict, chat_id: int, *keys: str) -> None:
+    """Apaga na hora as mensagens de status das etapas concluidas."""
+    for key in keys:
+        message_id = user_data.pop(key, None)
+        if message_id:
+            _delete_later(context, chat_id, message_id, delay=3.0)
 
 
 def campaign_dir(settings: Settings, campaign_id: int) -> Path:
