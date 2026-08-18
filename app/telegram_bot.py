@@ -24,6 +24,7 @@ from .csv_utils import mime_from_name, parse_contacts_file, parse_contacts_vcf_t
 from .db import Database
 from .evolution import EvolutionClient, EvolutionError, normalize_phone
 from .evolution_power import EvolutionPowerManager
+from .llm import LLMConfig, LLMError, generate_variants
 from .profiles import get_profile
 from .scheduler import CampaignScheduler, campaign_controls, cancel_confirmation_controls
 
@@ -1878,6 +1879,13 @@ def media_size_allowed(file_size: int | None, max_mb: int) -> bool:
 
 async def media_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _discard_status_messages(context, context.user_data, update.effective_chat.id, "media_status_msg", "import_status_msg")
+    if _llm_enabled(context):
+        await update.effective_message.reply_text(
+            "Agora escreva a mensagem que vai junto das fotos. 💬\n\n"
+            "✨ Com o gerador de variações ativo, cada cliente recebe essa "
+            "mensagem com um texto levemente diferente (mesmas fotos, mesma oferta)."
+        )
+        return WAITING_CAPTION
     await update.effective_message.reply_text(
         "Agora escreva a mensagem que vai junto das fotos. 💬\n\n"
         "Só as fotos, sem texto? Toque no botão abaixo.",
@@ -1905,8 +1913,57 @@ async def receive_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await db.set_caption(campaign_id, update.message.text)
+    await _generate_caption_variants(context, update.effective_chat.id, db, campaign_id)
     await reply_campaign_ready(update.effective_message, db, campaign_id)
     return ConversationHandler.END
+
+
+def _llm_enabled(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    settings = context.application.bot_data.get("settings")
+    return bool(settings and settings.llm_provider and settings.llm_api_key)
+
+
+async def _generate_caption_variants(context: ContextTypes.DEFAULT_TYPE, chat_id: int, db: Database, campaign_id: int):
+    """Gera as variantes de legenda via LLM (1 chamada por campanha, nao por cliente).
+
+    Falha nunca bloqueia o disparo: sem variantes, o scheduler cai no texto
+    original da vendedora (comportamento antigo, com spintax).
+    """
+    if not _llm_enabled(context):
+        return
+    settings = context.application.bot_data["settings"]
+    campaign = await db.get_campaign(campaign_id)
+    caption = (campaign or {}).get("caption") or ""
+    if not caption.strip():
+        return
+    cfg = LLMConfig(
+        provider=settings.llm_provider,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        variants=settings.llm_variants,
+    )
+    status = await context.bot.send_message(
+        chat_id,
+        "✨ Gerando variações de texto... (uma vez por campanha, não por cliente)",
+    )
+    try:
+        variants = await generate_variants(caption, cfg)
+        await db.replace_caption_variants(campaign_id, [caption] + variants)
+        await status.edit_text(
+            f"✨ {len(variants)} variações geradas. Cada cliente recebe o texto com uma redação levemente diferente."
+        )
+    except LLMError as exc:
+        logger.warning("Variantes nao geradas (%s): campanha segue com texto original", exc)
+        await status.edit_text(
+            "⚠️ Não consegui gerar variações agora — a campanha segue com o texto original. "
+            "Pode disparar sem problema."
+        )
+    except Exception:
+        logger.exception("Falha ao gerar variantes de legenda")
+        await status.edit_text(
+            "⚠️ Falha inesperada ao gerar variações — a campanha segue com o texto original. "
+            "Pode disparar sem problema."
+        )
 
 
 async def receive_no_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1914,6 +1971,15 @@ async def receive_no_caption(update: Update, context: ContextTypes.DEFAULT_TYPE)
     campaign_id = context.user_data.get("campaign_id")
     if not campaign_id:
         return ConversationHandler.END
+
+    # Com o gerador de variacoes ativo, texto e obrigatorio (e preciso de um
+    # texto pra variar).
+    if _llm_enabled(context):
+        await update.effective_message.reply_text(
+            "Com o gerador de variações ativo, a mensagem é obrigatória. ✍️ "
+            "Escreva o texto que vai junto das fotos:"
+        )
+        return WAITING_CAPTION
 
     media_count = await db.count_media(campaign_id)
     if media_count <= 0:

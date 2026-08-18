@@ -138,6 +138,10 @@ services:
       - WEBHOOK_TOKEN=${WEBHOOK_TOKEN:-}
       - WEBHOOK_PUBLIC_URL=${WEBHOOK_PUBLIC_URL:-}
       - WEBHOOK_AUTO_CONFIGURE=${WEBHOOK_AUTO_CONFIGURE:-true}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_VARIANTS=${LLM_VARIANTS:-8}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data

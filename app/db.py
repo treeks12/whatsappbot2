@@ -134,6 +134,16 @@ CREATE TABLE IF NOT EXISTS blacklist (
 CREATE INDEX IF NOT EXISTS idx_blacklist_phone ON blacklist(phone);
 CREATE INDEX IF NOT EXISTS idx_blacklist_added_at ON blacklist(added_at);
 
+-- Variantes de legenda geradas por LLM (uma chamada por campanha; a
+-- original da vendedora fica em campaigns.caption e vira a variante 0).
+CREATE TABLE IF NOT EXISTS caption_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    variant_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    UNIQUE(campaign_id, variant_index)
+);
+
 CREATE TABLE IF NOT EXISTS contact_health (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vendor_id INTEGER NOT NULL,
@@ -355,6 +365,25 @@ class Database:
         async with self._lock:
             with self.connect() as conn:
                 conn.execute("UPDATE campaigns SET caption = ?, status = 'ready' WHERE id = ?", (caption, campaign_id))
+
+    async def replace_caption_variants(self, campaign_id: int, variants: list[str]):
+        """Variante 0 = legenda original; LLM gera as demais. Idempotente."""
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM caption_variants WHERE campaign_id = ?", (campaign_id,))
+                conn.executemany(
+                    "INSERT INTO caption_variants (campaign_id, variant_index, text) VALUES (?, ?, ?)",
+                    [(campaign_id, index, text) for index, text in enumerate(variants)],
+                )
+
+    async def get_caption_variants(self, campaign_id: int) -> list[str]:
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT text FROM caption_variants WHERE campaign_id = ? ORDER BY variant_index",
+                    (campaign_id,),
+                ).fetchall()
+                return [row["text"] for row in rows]
 
     async def add_contacts(self, campaign_id: int, contacts: Iterable[dict]) -> dict:
         """Insere contatos na campanha, ignorando os que estao em blacklist.

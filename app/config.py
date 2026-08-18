@@ -61,6 +61,10 @@ class Settings:
     webhook_token: str
     webhook_public_url: str
     webhook_auto_configure: bool
+    llm_provider: str
+    llm_api_key: str
+    llm_model: str
+    llm_variants: int
 
 
 def load_settings() -> Settings:
@@ -109,4 +113,10 @@ def load_settings() -> Settings:
         webhook_token=webhook_token,
         webhook_public_url=webhook_public_url,
         webhook_auto_configure=webhook_auto_configure,
+        # Variantes de legenda via LLM (uma chamada por campanha). Provider
+        # vazio = desligado (cai no comportamento antigo: so spintax).
+        llm_provider=os.getenv("LLM_PROVIDER", "").strip().lower(),
+        llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
+        llm_model=os.getenv("LLM_MODEL", "").strip(),
+        llm_variants=_int_env("LLM_VARIANTS", 8),
     )

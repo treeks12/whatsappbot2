@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import logging
 import random
 import re
@@ -10,7 +11,7 @@ import zlib
 from datetime import datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
@@ -206,6 +207,9 @@ class CampaignScheduler:
                 await self._ensure_connection_open(instance_name)
                 await self.db.start_campaign(campaign_id)
                 media_items = await self.db.get_media(campaign_id)
+                # Variantes de legenda geradas por LLM (vazia se desligado);
+                # distribuidas deterministicamente por destinatario no envio.
+                caption_variants = await self.db.get_caption_variants(campaign_id)
                 media_cache: Dict[str, bytes] = {}
                 await progress.update(
                     f"Campanha #{campaign_id} iniciada.\n"
@@ -260,7 +264,7 @@ class CampaignScheduler:
                             await self.db.record_send_attempt(campaign["vendor_id"], contact["phone"])
                         except Exception:
                             logger.warning("Falha ao registrar tentativa para %s", contact["id"], exc_info=True)
-                        await self._send_contact(campaign, contact, profile, media_items, media_cache)
+                        await self._send_contact(campaign, contact, profile, media_items, media_cache, caption_variants)
                         await self.db.mark_contact_sent(campaign_id, contact["id"], contact["phone"])
                         self.suspicion.decay(instance_name)
                         # Aparecer offline durante a espera longa entre contatos:
@@ -342,14 +346,22 @@ class CampaignScheduler:
             finally:
                 await self._stop_evolution_if_idle()
 
-    async def _send_contact(self, campaign, contact, profile, media_items, media_cache: Dict[str, bytes]):
+    async def _send_contact(self, campaign, contact, profile, media_items, media_cache: Dict[str, bytes], caption_variants: Optional[List[str]] = None):
         await self._wait_for_memory()
         text = render_caption(
-            campaign["caption"] or "",
+            select_caption_variant(caption_variants, campaign["caption"] or "", contact["phone"]),
             contact["name"] or "Cliente",
         )
 
-        for index, media in enumerate(media_items):
+        # Ordens iguais de foto pra todo mundo sao fingerprint. Embaralha
+        # deterministicamente por destinatario: mesmo cliente sempre mesma ordem.
+        media_order = media_items
+        if len(media_items) > 1:
+            rng = random.Random(_stable_seed(f"{campaign['id']}:{contact['phone']}:media"))
+            media_order = list(media_items)
+            rng.shuffle(media_order)
+
+        for index, media in enumerate(media_order):
             is_last_media = index == len(media_items) - 1
             await self._wait_for_memory()
             raw_media = media_cache.get(media["path"])
@@ -508,6 +520,22 @@ def _parse_zone(raw: str):
     except ZoneInfoNotFoundError:
         logger.warning("SEND_WINDOW_TZ '%s' invalido; janela usara a hora do container.", raw)
         return None
+
+
+def _stable_seed(key: str) -> int:
+    """Hash estavel entre restarts (o hash() do Python e salgado por processo)."""
+    return int.from_bytes(hashlib.md5(key.encode("utf-8")).digest()[:4], "big")
+
+
+def select_caption_variant(variants: Optional[List[str]], text: str, phone: str) -> str:
+    """Escolhe a variante da legenda pro destinatario, deterministicamente.
+
+    Mesmo cliente recebe sempre a mesma variante entre campanhas/restarts.
+    Sem variantes geradas, cai no texto original (comportamento antigo).
+    """
+    if not variants:
+        return text or ""
+    return variants[_stable_seed(f"{phone}:caption") % len(variants)]
 
 
 def render_caption(template: str, contact_name: str) -> str:
