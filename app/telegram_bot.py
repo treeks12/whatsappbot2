@@ -22,7 +22,7 @@ from telegram.ext import (
 from .config import Settings
 from .csv_utils import mime_from_name, parse_contacts_file, parse_contacts_vcf_text, usable_phone
 from .db import Database
-from .evolution import EvolutionClient, normalize_phone
+from .evolution import EvolutionClient, EvolutionError, normalize_phone
 from .evolution_power import EvolutionPowerManager
 from .profiles import get_profile
 from .scheduler import CampaignScheduler, campaign_controls, cancel_confirmation_controls
@@ -363,6 +363,100 @@ async def receive_connect_phone(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+async def _send_pairing_code_message(query, code: str):
+    await safe_edit_query_text(
+        query,
+        f"🔢 Seu código de conexão:\n\n        {format_pairing_code(code)}\n\n"
+        "No celular, abra o WhatsApp e toque:\n"
+        "1. Configurações (a engrenagem ⚙️)\n"
+        "2. Aparelhos conectados\n"
+        "3. Conectar um aparelho\n"
+        "4. Conectar com número de telefone\n"
+        "5. Digite o código acima\n\n"
+        "O código expira em poucos minutos. Eu aviso aqui quando conectar. 😉",
+    )
+
+
+def _reset_offer_keyboard(mode: str) -> InlineKeyboardMarkup:
+    label = "🔄 Resetar e gerar código" if mode == "pair" else "🔄 Resetar e gerar QR"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"cconnect_reset_{mode}")],
+        back_to_menu_row(),
+    ])
+
+
+async def _maybe_offer_reset(query, context, exc: Exception, mode: str) -> bool:
+    """Quando a sessao antiga morreu e travou a instancia na Evolution,
+    oferece o reset (apagar sessao morta e comecar de novo)."""
+    text = str(exc)
+    if "Pairing code nao retornado" not in text and "nao retornou QR" not in text:
+        return False
+    await safe_edit_query_text(
+        query,
+        "A conexão antiga desse número ficou presa no sistema. 😕\n"
+        "Um reset resolve: apago a sessão morta e começo de novo.\n"
+        "Seus contatos e campanhas ficam salvos — é só conectar de novo.",
+        reply_markup=_reset_offer_keyboard(mode),
+    )
+    return True
+
+
+async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    """Apaga a instancia com sessao morta e refaz o fluxo de conexao."""
+    await query.answer("Resetando a conexão...")
+    settings, db, evolution, _ = services(context)
+    power = power_service(context)
+    user = query.from_user
+    instance_name = f"vendor_{user.id}"
+
+    if await evolution.connection_state(instance_name) == "open":
+        await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
+        return
+
+    try:
+        await power.ensure_running()
+        try:
+            await evolution.delete_instance(instance_name)
+        except Exception:
+            logger.warning("Falha ao apagar instancia %s no reset", instance_name, exc_info=True)
+        if mode == "pair":
+            phone = await db.get_vendor_phone(user.id)
+            if not phone:
+                await safe_edit_query_text(
+                    query,
+                    "Não encontrei seu número salvo. Use 📱 Conectar WhatsApp no menu.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+            await _send_pairing_code_message(query, await evolution.request_pairing_code(instance_name, phone))
+        else:
+            qr_base64 = await evolution.ensure_fresh_qr(instance_name)
+            image = qr_photo_bytes(qr_base64)
+            if not image:
+                raise EvolutionError("QR nao retornado apos reset")
+            await query.message.reply_photo(
+                photo=io.BytesIO(image),
+                caption=(
+                    "Escaneie no WhatsApp: Configurações > Aparelhos conectados > Conectar aparelho.\n\n"
+                    "Não deu tempo? Eu mando um QR novo automaticamente. 😉"
+                ),
+            )
+            schedule_idle_stop(context)
+            _spawn_qr_watch(context, user.id, instance_name, query.message.chat_id)
+            return
+    except Exception as exc:
+        logger.exception("Erro no reset de conexao")
+        await notify_admins(
+            context,
+            f"⚠️ Falha no reset de conexao\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
+        return
+
+    schedule_idle_stop(context)
+    _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id)
+
+
 async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Gerando seu código...")
     settings, db, evolution, _ = services(context)
@@ -384,6 +478,8 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
         code = await evolution.request_pairing_code(instance_name, phone)
     except Exception as exc:
         logger.exception("Erro ao gerar pairing code")
+        if await _maybe_offer_reset(query, context, exc, "pair"):
+            return
         await notify_admins(
             context,
             f"⚠️ Falha ao gerar pairing code\nUsuário: {user.full_name} ({user.id})\n{exc}",
@@ -395,17 +491,7 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
         return
 
-    await safe_edit_query_text(
-        query,
-        f"🔢 Seu código de conexão:\n\n        {format_pairing_code(code)}\n\n"
-        "No celular, abra o WhatsApp e toque:\n"
-        "1. Configurações (a engrenagem ⚙️)\n"
-        "2. Aparelhos conectados\n"
-        "3. Conectar um aparelho\n"
-        "4. Conectar com número de telefone\n"
-        "5. Digite o código acima\n\n"
-        "O código expira em poucos minutos. Eu aviso aqui quando conectar. 😉",
-    )
+    await _send_pairing_code_message(query, code)
     schedule_idle_stop(context)
     _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id)
 
@@ -422,6 +508,8 @@ async def start_qr_connect(query, context: ContextTypes.DEFAULT_TYPE):
         qr_base64 = await evolution.ensure_fresh_qr(instance_name)
     except Exception as exc:
         logger.exception("Erro ao gerar QR")
+        if await _maybe_offer_reset(query, context, exc, "qr"):
+            return
         await notify_admins(
             context,
             f"⚠️ Falha ao gerar QR\nUsuário: {user.full_name} ({user.id})\n{exc}",
@@ -1956,6 +2044,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cconnect_qr":
         await start_qr_connect(query, context)
+        return
+
+    if data.startswith("cconnect_reset_"):
+        await reset_and_connect(query, context, data[len("cconnect_reset_"):])
         return
 
     if data.startswith("campaign_"):
