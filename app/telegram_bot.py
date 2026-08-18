@@ -419,6 +419,9 @@ async def reset_and_connect(query, context: ContextTypes.DEFAULT_TYPE, mode: str
             await evolution.delete_instance(instance_name)
         except Exception:
             logger.warning("Falha ao apagar instancia %s no reset", instance_name, exc_info=True)
+        # Limpeza interna da Evolution e assincrona; dar respiro evita colisao
+        # entre o delete e o create que vem a seguir.
+        await asyncio.sleep(3)
         if mode == "pair":
             phone = await db.get_vendor_phone(user.id)
             if not phone:

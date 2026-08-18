@@ -150,10 +150,29 @@ class EvolutionClient:
             if not _is_existing_instance_error(exc):
                 raise
 
-        payload = await self._request(
-            "GET",
-            f"/instance/connect/{instance_name}?number={phone_e164}",
-        )
+        # Apos um delete, a limpeza interna da Evolution e assincrona: o create pode
+        # bater em restos ("ja existe") e o connect pegar o meio da limpeza (404
+        # "does not exist"). Recreate com paciencia ate o connect responder.
+        payload = None
+        for _ in range(3):
+            try:
+                payload = await self._request(
+                    "GET",
+                    f"/instance/connect/{instance_name}?number={phone_e164}",
+                )
+                break
+            except EvolutionError as exc:
+                if "does not exist" not in str(exc):
+                    raise
+                await asyncio.sleep(3)
+                try:
+                    await self.create_instance(instance_name, qrcode=False)
+                except EvolutionError as exc2:
+                    if not _is_existing_instance_error(exc2):
+                        raise
+        if payload is None:
+            raise EvolutionError(f"Instancia {instance_name} nao ficou disponivel apos recreate")
+
         code = str(payload.get("pairingCode") or "").strip()
         if not code:
             # Uma sessao QR pendente de tentativa anterior pode segurar o pairing;
