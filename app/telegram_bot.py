@@ -1927,26 +1927,27 @@ async def _generate_caption_variants(context: ContextTypes.DEFAULT_TYPE, chat_id
     """Gera as variantes de legenda via LLM (1 chamada por campanha, nao por cliente).
 
     Falha nunca bloqueia o disparo: sem variantes, o scheduler cai no texto
-    original da vendedora (comportamento antigo, com spintax).
+    original da vendedora (comportamento antigo, com spintax). Todo o corpo fica
+    dentro do try/except de proposito — nem bug aqui pode quebrar o fluxo.
     """
     if not _llm_enabled(context):
         return
-    settings = context.application.bot_data["settings"]
-    campaign = await db.get_campaign(campaign_id)
-    caption = (campaign or {}).get("caption") or ""
-    if not caption.strip():
-        return
-    cfg = LLMConfig(
-        provider=settings.llm_provider,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        variants=settings.llm_variants,
-    )
-    status = await context.bot.send_message(
-        chat_id,
-        "✨ Gerando variações de texto... (uma vez por campanha, não por cliente)",
-    )
     try:
+        settings = context.application.bot_data["settings"]
+        campaign = await db.get_campaign(campaign_id)
+        caption = campaign["caption"] if campaign else ""
+        if not caption.strip():
+            return
+        cfg = LLMConfig(
+            provider=settings.llm_provider,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            variants=settings.llm_variants,
+        )
+        status = await context.bot.send_message(
+            chat_id,
+            "✨ Gerando variações de texto... (uma vez por campanha, não por cliente)",
+        )
         variants = await generate_variants(caption, cfg)
         await db.replace_caption_variants(campaign_id, [caption] + variants)
         await status.edit_text(
@@ -1960,10 +1961,13 @@ async def _generate_caption_variants(context: ContextTypes.DEFAULT_TYPE, chat_id
         )
     except Exception:
         logger.exception("Falha ao gerar variantes de legenda")
-        await status.edit_text(
-            "⚠️ Falha inesperada ao gerar variações — a campanha segue com o texto original. "
-            "Pode disparar sem problema."
-        )
+        try:
+            await status.edit_text(
+                "⚠️ Falha inesperada ao gerar variações — a campanha segue com o texto original. "
+                "Pode disparar sem problema."
+            )
+        except Exception:
+            pass
 
 
 async def receive_no_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
