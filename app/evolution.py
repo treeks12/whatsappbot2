@@ -129,6 +129,32 @@ class EvolutionClient:
     async def connect_instance(self, instance_name: str) -> Dict[str, Any]:
         return await self._request("GET", f"/instance/connect/{instance_name}")
 
+    async def request_pairing_code(self, instance_name: str, phone_e164: str) -> str:
+        """Pede um pairing code (codigo de digitos) para conectar sem escanear QR.
+
+        A vendedora digita o codigo no celular em WhatsApp > Aparelhos conectados >
+        Conectar com numero de telefone. Retorna "" se a sessao ja estiver aberta.
+        """
+        if await self.connection_state(instance_name) == "open":
+            return ""
+
+        try:
+            await self.create_instance(instance_name)
+        except EvolutionError as exc:
+            if not _is_existing_instance_error(exc):
+                raise
+
+        payload = await self._request(
+            "POST",
+            f"/instance/connect/{instance_name}",
+            json={"number": phone_e164, "qrcode": False},
+        )
+        pairing = payload.get("pairing") if isinstance(payload, dict) else None
+        code = str((pairing or {}).get("code") or "").strip() if isinstance(pairing, dict) else ""
+        if not code:
+            raise EvolutionError(f"Pairing code nao retornado para {instance_name}: {payload}")
+        return code
+
     async def disconnect_instance(self, instance_name: str) -> bool:
         # Evolution v2 exposes logout endpoints, but logout can unpair the phone.
         # For "disconnect without losing session" the safe local action is stopping

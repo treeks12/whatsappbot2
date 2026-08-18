@@ -5,17 +5,37 @@ Bot Telegram para operar campanhas pequenas de WhatsApp usando Evolution API 2.4
 ## O Que Ele Faz
 
 - Cada vendedora usa o proprio usuario Telegram autorizado.
-- Cada vendedora conecta um WhatsApp proprio via `/login`.
+- Cada vendedora conecta um WhatsApp proprio pelo menu ou `/login`.
 - Cada vendedora ganha uma instancia Evolution propria: `vendor_<telegram_user_id>`.
 - Campanhas de vendedoras diferentes rodam em paralelo.
 - Dentro do mesmo numero, o envio e sequencial e cadenciado.
 - Aceita contatos em CSV, VCF bruto, ZIP com CSV/VCF, ou contatos encaminhados pelo Telegram.
 - Aceita imagem com legenda, varias imagens com legenda na ultima, texto puro, ou somente imagem.
 
+## Menu Por Botoes
+
+O dia a dia funciona inteiro por botoes: `/start` ou `/menu` abre o menu principal com
+Nova campanha, Minhas listas, Status, Conectar WhatsApp e Bloquear numero. Quem prefere
+digitar tem os atalhos em `/atalhos` (os comandos continuam funcionando).
+
+## Conectar O WhatsApp
+
+Ha dois jeitos, ambos pelo botao `📱 Conectar WhatsApp`:
+
+- **Codigo de pareamento** (recomendado): a vendedora digita o numero do WhatsApp uma unica
+  vez; o bot gera um codigo de 8 digitos e ela digita no celular em
+  `WhatsApp > Configuracoes > Aparelhos conectados > Conectar com numero de telefone`.
+  O bot avisa sozinho quando a conexao abre.
+- **QR Code**: alternativa pelo botao `📷 Conectar com QR Code`; se o QR expirar sem escanear,
+  o bot reenvia um novo automaticamente (ate 3 vezes).
+
+O numero fica salvo em `vendors.phone_e164`, entao reconexoes futuras sao um toque so.
+
 ## Comandos
 
-- `/start`: mostra o menu basico.
-- `/login`: conecta o WhatsApp da vendedora via QR Code.
+- `/start`: abre o menu principal (pede permissao se for usuario novo).
+- `/menu`: reabre o menu principal.
+- `/atalhos`: lista os comandos de teclado.
 - `/conexao`: mostra o estado atual da conexao WhatsApp da vendedora.
 - `/desconectar`: tenta desconectar a sessao sem logout; se a Evolution nao suportar, desliga o container mantendo a sessao.
 - `/nova`: cria campanha no perfil de precaucao.
@@ -41,21 +61,25 @@ Os contatos importados mantem `row_index` para auditoria, mas a ordem de envio u
 
 ## Pre-flight Antes Do Disparo
 
-`/disparar` agora abre um painel de pre-flight em vez de comecar imediatamente. O bot classifica os contatos pendentes em quatro grupos com base no historico de eventos (delivered/read/replied) capturados pelo webhook da Evolution:
+`/disparar` (ou o botao `🚀 Revisar e disparar`) abre um painel de revisao em vez de comecar
+imediatamente. O bot classifica os contatos pendentes em quatro grupos com base no historico
+de eventos (delivered/read/replied) capturados pelo webhook da Evolution:
 
-- **Quentes**: responderam em < 90 dias OU leram em < 30 dias.
-- **Mornos**: tem ao menos uma entrega confirmada e nao se enquadram em quente/frio.
-- **Frios**: ultima entrega ha mais de 180 dias OU 2+ envios seguidos sem nenhuma entrega.
-- **Sem historico**: nunca foram tocados nessa base.
+- **Responderam recentemente**: responderam em < 90 dias OU leram em < 30 dias.
+- **Ja receberam antes**: tem ao menos uma entrega confirmada e nao se enquadram nos outros.
+- **Sumidos ha muito tempo**: ultima entrega ha mais de 180 dias OU 2+ envios seguidos sem nenhuma entrega.
+- **Nunca receberam**: nunca foram tocados nessa base.
 
 Botoes do painel:
 
-- **Disparar agora**: inicia a campanha como antes.
-- **Excluir frios**: marca os contatos frios como falha (`preflight: frio`) sem enviar.
-- **Verificar WhatsApp ativo**: chama `POST /chat/whatsappNumbers` na Evolution e marca como falha (`preflight: sem whatsapp`) os numeros que nao existem mais.
+- **Preparar e disparar**: remove automaticamente os contatos "sumidos ha muito tempo"
+  (marcados como `preflight: frio`) e inicia a campanha. A remocao aparece na mensagem de progresso.
+- **Checar numeros no WhatsApp**: chama `POST /chat/whatsappNumbers` na Evolution e marca como
+  falha (`preflight: sem whatsapp`) os numeros que nao existem mais.
 - **Cancelar disparo**: fecha o painel sem mexer na campanha.
 
-Nas duas primeiras execucoes, "Frios" e "Sem historico" podem aparecer iguais (ambos sem dados); a precisao melhora a medida que os webhooks de delivered/read/replied chegam para campanhas seguintes.
+Se o bot reiniciar no meio de uma campanha em construcao, o menu mostra um cartao com
+"Continuar de onde parei" — o estado e reconstruido do SQLite (contatos, fotos, texto).
 
 ## Webhook Da Evolution
 

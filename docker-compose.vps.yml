@@ -3,6 +3,11 @@ services:
     image: postgres:16-alpine
     container_name: evolution-db
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - POSTGRES_DB=evolution
       - POSTGRES_USER=evolution
@@ -16,8 +21,16 @@ services:
     image: evoapicloud/evolution-api:2.4.0-rc2
     container_name: evolution-api
     ports:
-      - "127.0.0.1:8080:8080"
+      # 8082 no host: o 8080 ja e usado por outro servico nesta VPS.
+      # O bot acessa a Evolution pela rede interna (evolution-api:8080),
+      # entao esta porta so serve para debug manual.
+      - "127.0.0.1:8082:8080"
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - evolution-db
       - evolution-redis
@@ -69,6 +82,11 @@ services:
     image: redis:7-alpine
     container_name: evolution-redis
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - evolution_redis:/data
@@ -81,6 +99,11 @@ services:
       dockerfile: Dockerfile
     container_name: whatsapp-bot-v2
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS:-}

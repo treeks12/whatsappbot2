@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from telegram import Update
@@ -78,6 +79,8 @@ async def post_init(application: Application):
         except Exception:
             logger.info("Webhook no boot adiado: Evolution ainda nao respondeu.")
     await power.stop_if_idle(db)
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(application))
+    application.bot_data["heartbeat_task"] = heartbeat_task
     logger.info("Bot v2 inicializado")
 
 
@@ -99,10 +102,50 @@ async def _reconfigure_vendor_instances(db: Database, evolution: EvolutionClient
             logger.warning("Falha ao reconfigurar webhook em %s", instance_name, exc_info=True)
 
 
+HEARTBEAT_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+async def _heartbeat_loop(application: Application):
+    """Aviso diario aos admins: o bot esta vivo e como esta a Evolution.
+
+    Mata o cenario "bot parado por meses e ninguem percebeu".
+    """
+    settings = application.bot_data["settings"]
+    db = application.bot_data["db"]
+    power = application.bot_data.get("power")
+
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            active = await db.count_running_or_paused_campaigns()
+            if power and power.enabled:
+                evolution_state = await power.container_state()
+            else:
+                evolution_state = "controle desativado"
+            text = (
+                "💓 Tudo certo por aqui — bot ativo.\n"
+                f"Campanhas em andamento: {active}.\n"
+                f"Evolution: {evolution_state}."
+                " (Desligada é normal quando não há campanha rodando.)"
+            )
+            for admin_id in settings.telegram_admin_ids:
+                try:
+                    await application.bot.send_message(chat_id=admin_id, text=text)
+                except Exception:
+                    logger.debug("Falha ao enviar heartbeat para %s", admin_id, exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Falha no heartbeat diario")
+
+
 async def post_shutdown(application: Application):
     evolution = application.bot_data.get("evolution")
     power = application.bot_data.get("power")
     webhook_server = application.bot_data.get("webhook_server")
+    heartbeat_task = application.bot_data.get("heartbeat_task")
+    if heartbeat_task:
+        heartbeat_task.cancel()
     if webhook_server:
         await webhook_server.close()
     if power:
@@ -117,6 +160,12 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN nao configurado")
     if not settings.evolution_api_key:
         raise RuntimeError("EVOLUTION_API_KEY nao configurado")
+    if not settings.telegram_admin_ids and not settings.allow_open_access:
+        raise RuntimeError(
+            "TELEGRAM_ADMIN_IDS vazio: o bot ficaria aberto para qualquer usuario do Telegram. "
+            "Preencha TELEGRAM_ADMIN_IDS no .env ou, se realmente quiser acesso aberto, "
+            "defina ALLOW_OPEN_ACCESS=true por sua conta e risco."
+        )
 
     db = Database(settings.database_path)
     evolution = EvolutionClient(

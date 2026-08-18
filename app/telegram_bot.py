@@ -3,6 +3,7 @@ import io
 import logging
 import asyncio
 import csv
+import re
 import warnings
 from pathlib import Path
 
@@ -39,13 +40,21 @@ logger = logging.getLogger(__name__)
     WAITING_REMOVE_CONTACTS,
     WAITING_RENAME_LIST,
     WAITING_BLACKLIST_FILE,
-) = range(9)
+    WAITING_PROFILE_CHOICE,
+    WAITING_CONNECT_PHONE,
+) = range(11)
 PERM_STATE_KEY = "perm_state"
 BLACKLIST_PAGE_SIZE = 15
+FRIENDLY_ERROR = (
+    "😞 Algo não funcionou agora. O suporte já foi avisado — "
+    "tente de novo em alguns minutos."
+)
 
 
 def register_handlers(application):
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("atalhos", atalhos))
     application.add_handler(CommandHandler("login", login))
     application.add_handler(CommandHandler("conexao", conexao))
     application.add_handler(CommandHandler("desconectar", desconectar))
@@ -62,25 +71,40 @@ def register_handlers(application):
                 entry_points=[
                     CommandHandler(["nova", "nova_confianca", "nova_precaucao"], nova),
                     CommandHandler("listas", listas),
+                    CallbackQueryHandler(menu_new_entry, pattern="^menu_new$"),
+                    CallbackQueryHandler(menu_lists_entry, pattern="^menu_lists$"),
+                    CallbackQueryHandler(menu_connect_entry, pattern="^menu_connect$"),
+                    CallbackQueryHandler(campaign_profile_callback, pattern="^cprof_"),
+                    CallbackQueryHandler(draft_continue_entry, pattern="^cdraft_continue_"),
                 ],
                 states={
+                    WAITING_PROFILE_CHOICE: [
+                        CallbackQueryHandler(campaign_profile_callback, pattern="^cprof_"),
+                    ],
+                    WAITING_CONNECT_PHONE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_connect_phone),
+                        CallbackQueryHandler(menu_connect_entry, pattern="^menu_connect$"),
+                    ],
                     WAITING_CONTACT_SOURCE: [
-                        CallbackQueryHandler(handle_contact_source_callback, pattern="^(src_|list_|menu_)"),
+                        CallbackQueryHandler(handle_contact_source_callback, pattern="^(src_|list_)"),
                     ],
                     WAITING_CSV: [
                         MessageHandler(filters.Document.ALL, receive_contacts_file),
                         MessageHandler(filters.CONTACT, receive_contact_card),
                         CommandHandler("pronto", contacts_done),
+                        CallbackQueryHandler(contacts_done_button, pattern="^ccontacts_done$"),
                     ],
                     WAITING_MEDIA: [
                         MessageHandler(filters.PHOTO, receive_photo),
                         MessageHandler(filters.Document.IMAGE, receive_image_document),
                         CommandHandler("pronto", media_done),
                         CommandHandler("sem_midia", media_done),
+                        CallbackQueryHandler(media_done_button, pattern="^cmedia_done$"),
                     ],
                     WAITING_CAPTION: [
                         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_caption),
                         CommandHandler("sem_texto", receive_no_caption),
+                        CallbackQueryHandler(no_caption_button, pattern="^ccap_none$"),
                     ],
                     WAITING_LIST_NAME: [
                         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_list_name),
@@ -136,6 +160,553 @@ def power_service(context: ContextTypes.DEFAULT_TYPE) -> EvolutionPowerManager:
     return context.application.bot_data["power"]
 
 
+# ----------------------------------------------------------------------------
+# Menu principal e navegacao por botoes
+# ----------------------------------------------------------------------------
+
+SHORTCUTS_TEXT = (
+    "Atalhos de teclado para quem prefere digitar:\n\n"
+    "/menu - menu principal\n"
+    "/login - conectar WhatsApp\n"
+    "/conexao - verificar conexao do WhatsApp\n"
+    "/desconectar - fechar conexao sem apagar sessao\n"
+    "/nova - criar campanha cautelosa\n"
+    "/nova_confianca - campanha para contatos de confianca\n"
+    "/nova_precaucao - campanha mais cuidadosa\n"
+    "/listas - gerenciar listas de contatos\n"
+    "/disparar - iniciar campanha pronta\n"
+    "/status - ver ultimas campanhas\n"
+    "/cancelar - cancelar campanha ativa\n"
+    "/blacklist - bloquear telefone\n"
+    "/blacklist_remover - remover telefone da blacklist\n"
+    "/blacklist_listar - ver telefones bloqueados\n"
+    "/blacklist_arquivo - importar varios telefones para a blacklist"
+)
+
+CONNECT_POLL_SECONDS = 5
+CONNECT_POLL_TIMEOUT = 180
+QR_REFRESH_ATTEMPTS = 3
+QR_REFRESH_SECONDS = 50
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 Nova campanha", callback_data="menu_new")],
+        [InlineKeyboardButton("👥 Minhas listas", callback_data="menu_lists")],
+        [InlineKeyboardButton("📊 Status", callback_data="menu_status")],
+        [InlineKeyboardButton("📱 Conectar WhatsApp", callback_data="menu_connect")],
+        [InlineKeyboardButton("⛔ Bloquear número", callback_data="menu_blacklist")],
+    ])
+
+
+def back_to_menu_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton("◀️ Voltar ao menu", callback_data="menu_main")]
+
+
+async def send_main_menu(message, hello: str = "Escolha o que fazer 👇"):
+    await message.reply_text(hello, reply_markup=main_menu_keyboard())
+
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
+    settings = context.application.bot_data["settings"]
+    for admin_id in settings.telegram_admin_ids:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception:
+            logger.debug("Falha ao avisar admin %s", admin_id, exc_info=True)
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+    await send_main_menu(update.effective_message)
+
+
+async def atalhos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_user(update, context):
+        return
+    await update.effective_message.reply_text(SHORTCUTS_TEXT)
+
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Acoes do menu principal que nao precisam de estado de conversa."""
+    query = update.callback_query
+    data = query.data or ""
+
+    if data == "menu_main":
+        await query.answer()
+        await send_main_menu(query.message)
+        return
+
+    if data == "menu_status":
+        await query.answer()
+        _, db, _, _ = services(context)
+        rows = await db.campaign_summary_for_vendor(query.from_user.id)
+        if not rows:
+            text = "Você ainda não tem campanhas. 🎉"
+        else:
+            lines = ["Suas últimas campanhas:"]
+            for row in rows:
+                processed = row["processed_count"] or 0
+                failed = row["failed_count"] or 0
+                lines.append(
+                    f"#{row['id']} {row['status']} - enviados {row['sent_count']} | "
+                    f"parados em {processed}/{row['total_contacts']} | falhas {failed}"
+                )
+            text = "\n".join(lines)
+        await query.message.reply_text(text, reply_markup=main_menu_keyboard())
+        return
+
+    if data == "menu_blacklist":
+        await query.answer()
+        await query.message.reply_text(
+            "Para um telefone nunca mais receber suas mensagens:\n\n"
+            "/blacklist 5511999998888 motivo opcional\n\n"
+            "Quer ver quem está bloqueado? Toque abaixo.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Ver bloqueados", callback_data="bl_menu_list")],
+                back_to_menu_row(),
+            ]),
+        )
+        return
+
+    await query.answer()
+
+
+# ----------------------------------------------------------------------------
+# Conexao do WhatsApp: pairing code (codigo) ou QR com auto-refresh
+# ----------------------------------------------------------------------------
+
+
+def format_pairing_code(code: str) -> str:
+    return f"{code[:4]}-{code[4:]}" if len(code) > 4 else code
+
+
+def connect_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Conectar com código", callback_data="cconnect_pair")],
+        [InlineKeyboardButton("📷 Conectar com QR Code", callback_data="cconnect_qr")],
+        back_to_menu_row(),
+    ])
+
+
+async def menu_connect_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    settings, db, evolution, _ = services(context)
+    power = power_service(context)
+    user = query.from_user
+    instance_name = f"vendor_{user.id}"
+    await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
+
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao ligar Evolution ao conectar")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao ligar Evolution (conectar WhatsApp)\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    state = await evolution.connection_state(instance_name)
+    if state == "open":
+        await ensure_instance_webhook(settings, evolution, instance_name)
+        await safe_edit_query_text(
+            query,
+            "✅ Seu WhatsApp já está conectado!\nSe precisar trocar, use /desconectar antes.",
+            reply_markup=main_menu_keyboard(),
+        )
+        schedule_idle_stop(context)
+        return ConversationHandler.END
+
+    phone = await db.get_vendor_phone(user.id)
+    if phone:
+        await safe_edit_query_text(
+            query,
+            f"Vamos conectar o WhatsApp do número {phone}.\n\n"
+            "🔢 Com código — você digita um número no WhatsApp. O mais fácil!\n"
+            "📷 Com QR Code — aponta a câmera.",
+            reply_markup=connect_choice_keyboard(),
+        )
+        schedule_idle_stop(context)
+        return ConversationHandler.END
+
+    await safe_edit_query_text(
+        query,
+        "Primeiro me diga: qual o número de WhatsApp que você usa para atender clientes?\n\n"
+        "Envie só o número com DDD. Exemplo: 11999998888",
+    )
+    return WAITING_CONNECT_PHONE
+
+
+async def receive_connect_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, db, _, _ = services(context)
+    digits = re.sub(r"\D", "", update.message.text or "")
+    phone = usable_phone(digits)
+    if not phone:
+        await update.message.reply_text(
+            "Não entendi o número. 🙈 Envie só números com DDD, por exemplo: 11999998888"
+        )
+        return WAITING_CONNECT_PHONE
+
+    user = update.effective_user
+    await db.set_vendor_phone(user.id, phone)
+    await update.message.reply_text(
+        f"Número {phone} salvo! ✅\nComo prefere conectar?",
+        reply_markup=connect_choice_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
+    await query.answer("Gerando seu código...")
+    settings, db, evolution, _ = services(context)
+    power = power_service(context)
+    user = query.from_user
+    instance_name = f"vendor_{user.id}"
+
+    phone = await db.get_vendor_phone(user.id)
+    if not phone:
+        await safe_edit_query_text(
+            query,
+            "Não encontrei seu número salvo. Toque em 📱 Conectar WhatsApp no menu para começar de novo.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    try:
+        await power.ensure_running()
+        code = await evolution.request_pairing_code(instance_name, phone)
+    except Exception as exc:
+        logger.exception("Erro ao gerar pairing code")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao gerar pairing code\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
+        return
+
+    if not code:
+        await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
+        return
+
+    await safe_edit_query_text(
+        query,
+        f"🔢 Seu código de conexão:\n\n        {format_pairing_code(code)}\n\n"
+        "No celular, abra o WhatsApp e toque:\n"
+        "1. Configurações (a engrenagem ⚙️)\n"
+        "2. Aparelhos conectados\n"
+        "3. Conectar um aparelho\n"
+        "4. Conectar com número de telefone\n"
+        "5. Digite o código acima\n\n"
+        "O código expira em poucos minutos. Eu aviso aqui quando conectar. 😉",
+    )
+    schedule_idle_stop(context)
+    _spawn_connect_watch(context, user.id, instance_name, query.message.chat_id)
+
+
+async def start_qr_connect(query, context: ContextTypes.DEFAULT_TYPE):
+    await query.answer()
+    settings, db, evolution, _ = services(context)
+    power = power_service(context)
+    user = query.from_user
+    instance_name = f"vendor_{user.id}"
+
+    try:
+        await power.ensure_running()
+        qr_base64 = await evolution.ensure_fresh_qr(instance_name)
+    except Exception as exc:
+        logger.exception("Erro ao gerar QR")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao gerar QR\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
+        return
+
+    if not qr_base64:
+        await safe_edit_query_text(query, "✅ Seu WhatsApp já está conectado!")
+        return
+
+    image = qr_photo_bytes(qr_base64)
+    if not image:
+        await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
+        return
+
+    await query.message.reply_photo(
+        photo=io.BytesIO(image),
+        caption=(
+            "Escaneie no WhatsApp: Configurações > Aparelhos conectados > Conectar aparelho.\n\n"
+            "Não deu tempo? Eu mando um QR novo automaticamente. 😉"
+        ),
+    )
+    schedule_idle_stop(context)
+    _spawn_qr_watch(context, user.id, instance_name, query.message.chat_id)
+
+
+def _cancel_previous_task(context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    previous = context.application.bot_data.get(key)
+    if previous and not previous.done():
+        previous.cancel()
+
+
+def _spawn_connect_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, instance_name: str, chat_id: int):
+    key = f"connect_watch_{user_id}"
+    _cancel_previous_task(context, key)
+
+    async def watch():
+        settings, db, evolution, _ = services(context)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CONNECT_POLL_TIMEOUT
+        while loop.time() < deadline:
+            await asyncio.sleep(CONNECT_POLL_SECONDS)
+            if await evolution.connection_state(instance_name) == "open":
+                await ensure_instance_webhook(settings, evolution, instance_name)
+                await context.bot.send_message(
+                    chat_id,
+                    "✅ WhatsApp conectado com sucesso! Pode criar suas campanhas. 🎉",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+        await context.bot.send_message(
+            chat_id,
+            "⏰ O código expirou sem conexão. Gere um novo quando quiser:",
+            reply_markup=connect_choice_keyboard(),
+        )
+
+    task = context.application.create_task(watch())
+    context.application.bot_data[key] = task
+
+
+def _spawn_qr_watch(context: ContextTypes.DEFAULT_TYPE, user_id: int, instance_name: str, chat_id: int):
+    key = f"connect_watch_{user_id}"
+    _cancel_previous_task(context, key)
+
+    async def watch():
+        settings, db, evolution, _ = services(context)
+        for attempt in range(QR_REFRESH_ATTEMPTS):
+            await asyncio.sleep(QR_REFRESH_SECONDS)
+            if await evolution.connection_state(instance_name) == "open":
+                await ensure_instance_webhook(settings, evolution, instance_name)
+                await context.bot.send_message(
+                    chat_id,
+                    "✅ WhatsApp conectado com sucesso! Pode criar suas campanhas. 🎉",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+            try:
+                qr_base64 = await evolution.ensure_fresh_qr(instance_name)
+            except Exception:
+                logger.warning("Falha ao renovar QR (tentativa %d)", attempt + 1, exc_info=True)
+                continue
+            image = qr_photo_bytes(qr_base64)
+            if image:
+                await context.bot.send_photo(
+                    chat_id,
+                    photo=io.BytesIO(image),
+                    caption=f"🔄 QR atualizado ({attempt + 2}/{QR_REFRESH_ATTEMPTS}). O anterior expirou.",
+                )
+        if await evolution.connection_state(instance_name) == "open":
+            await context.bot.send_message(chat_id, "✅ WhatsApp conectado! 🎉")
+            return
+        await context.bot.send_message(
+            chat_id,
+            "⏰ Os QR Codes expiraram sem conexão. Toque abaixo para tentar de novo:",
+            reply_markup=connect_choice_keyboard(),
+        )
+
+    task = context.application.create_task(watch())
+    context.application.bot_data[key] = task
+
+
+# ----------------------------------------------------------------------------
+# Nova campanha por botoes (escolha de perfil + continuacao de rascunho)
+# ----------------------------------------------------------------------------
+
+
+async def menu_new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    settings, db, _, _ = services(context)
+    user = query.from_user
+    await db.ensure_vendor(user.id, user.username or f"user_{user.id}", f"vendor_{user.id}")
+
+    active = await db.get_active_campaign_for_vendor(user.id)
+    if active:
+        await show_active_campaign_card(query, context, active)
+        return ConversationHandler.END
+
+    await safe_edit_query_text(
+        query,
+        "Que tipo de campanha vamos criar?\n\n"
+        "⚡ Clientes de confiança — mais rápida, para quem já conhece a loja.\n"
+        "🐢 Cautelosa — mais devagar, ideal para contatos novos.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Clientes de confiança", callback_data="cprof_confianca_100")],
+            [InlineKeyboardButton("🐢 Cautelosa (contatos novos)", callback_data="cprof_precaucao_100")],
+            back_to_menu_row(),
+        ]),
+    )
+    return WAITING_PROFILE_CHOICE
+
+
+async def campaign_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    settings, db, evolution, _ = services(context)
+    power = power_service(context)
+    user = query.from_user
+    instance_name = f"vendor_{user.id}"
+    await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
+
+    profile_id = (query.data or "")[len("cprof_"):]
+    context.user_data["pending_campaign_profile_id"] = profile_id
+
+    active = await db.get_active_campaign_for_vendor(user.id)
+    if active:
+        await show_active_campaign_card(query, context, active)
+        return ConversationHandler.END
+
+    try:
+        await power.ensure_running()
+    except Exception as exc:
+        logger.exception("Erro ao ligar Evolution ao criar campanha")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao ligar Evolution (nova campanha)\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await safe_edit_query_text(query, FRIENDLY_ERROR, reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    state = await evolution.connection_state(instance_name)
+    if state != "open":
+        await safe_edit_query_text(
+            query,
+            "Seu WhatsApp ainda não está conectado. 😕\n"
+            "Conecte primeiro (leva 1 minutinho) e depois volte aqui.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Conectar WhatsApp agora", callback_data="menu_connect")],
+                back_to_menu_row(),
+            ]),
+        )
+        schedule_idle_stop(context)
+        return ConversationHandler.END
+
+    await ensure_instance_webhook(settings, evolution, instance_name)
+    await show_campaign_contact_source(query.message, db, user.id, profile_id)
+    schedule_idle_stop(context)
+    return WAITING_CONTACT_SOURCE
+
+
+async def menu_lists_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    context.user_data.pop("pending_campaign_profile_id", None)
+    db = context.application.bot_data["db"]
+    await show_lists_menu(query, db, query.from_user.id, edit=True)
+    return WAITING_CONTACT_SOURCE
+
+
+async def show_active_campaign_card(query, context: ContextTypes.DEFAULT_TYPE, campaign):
+    """Cartao com o estado da campanha ativa e as acoes possiveis."""
+    campaign_id = campaign["id"]
+    total = campaign["total_contacts"] or 0
+    status = campaign["status"]
+
+    if status in ("running", "paused"):
+        state_text = "em andamento ⏳" if status == "running" else "pausada ⏸"
+        text = f"📣 Sua campanha #{campaign_id} está {state_text}.\nContatos: {total}."
+        keyboard = [
+            [InlineKeyboardButton("📊 Ver andamento", callback_data="menu_status")],
+            back_to_menu_row(),
+        ]
+    elif status == "ready":
+        text = f"📣 Campanha #{campaign_id} pronta com {total} contatos.\nFalta só revisar e disparar!"
+        keyboard = [
+            [InlineKeyboardButton("🚀 Revisar e disparar", callback_data=f"cdisp_go_{campaign_id}")],
+            [InlineKeyboardButton("🗑 Descartar campanha", callback_data=f"cdraft_discard_{campaign_id}")],
+            back_to_menu_row(),
+        ]
+    else:  # draft
+        text = (
+            f"📣 Você tem uma campanha incompleta (#{campaign_id}) com {total} contatos.\n"
+            "Quer continuar de onde parou?"
+        )
+        keyboard = [
+            [InlineKeyboardButton("▶️ Continuar de onde parei", callback_data=f"cdraft_continue_{campaign_id}")],
+            [InlineKeyboardButton("🗑 Descartar e começar outra", callback_data=f"cdraft_discard_{campaign_id}")],
+            back_to_menu_row(),
+        ]
+
+    await safe_edit_query_text(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def draft_continue_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_user(update, context):
+        return ConversationHandler.END
+
+    settings, db, _, _ = services(context)
+    try:
+        campaign_id = int((query.data or "").split("_")[-1])
+    except ValueError:
+        await safe_edit_query_text(query, "Campanha não encontrada.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    campaign = await db.get_campaign(campaign_id)
+    if (
+        not campaign
+        or campaign["vendor_id"] != query.from_user.id
+        or campaign["status"] != "draft"
+    ):
+        await safe_edit_query_text(query, "Essa campanha não está mais disponível.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    context.user_data["campaign_id"] = campaign_id
+    context.user_data["pending_campaign_profile_id"] = campaign["profile_id"]
+    campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
+
+    if (campaign["total_contacts"] or 0) <= 0:
+        await safe_edit_query_text(
+            query,
+            f"Continuando a campanha #{campaign_id}. 👍\n\n"
+            "Envie os contatos: arquivo CSV, VCF, ZIP ou contatos do Telegram.\n"
+            "Quando terminar, toque no botão abaixo.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Terminei os contatos", callback_data="ccontacts_done")],
+                [InlineKeyboardButton("🗑 Descartar", callback_data=f"cdraft_discard_{campaign_id}")],
+            ]),
+        )
+        return WAITING_CSV
+
+    await safe_edit_query_text(
+        query,
+        f"Continuando a campanha #{campaign_id}. 👍\n\n"
+        f"Contatos já importados: {campaign['total_contacts']}.\n"
+        "Agora envie as fotos, uma por vez. Sem fotos? Toque no botão abaixo.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Continuar sem fotos", callback_data="cmedia_done")],
+            [InlineKeyboardButton("🗑 Descartar", callback_data=f"cdraft_discard_{campaign_id}")],
+        ]),
+    )
+    return WAITING_MEDIA
+
+
 async def ensure_instance_webhook(settings: Settings, evolution: EvolutionClient, instance_name: str):
     if not (settings.webhook_auto_configure and settings.webhook_public_url and settings.webhook_token):
         return
@@ -165,23 +736,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if is_authorized(settings, user_id) or await db.is_user_approved(user_id):
-        await update.message.reply_text(
-            "Bot v2 ativo.\n\n"
-            "/login - conectar WhatsApp\n"
-            "/conexao - verificar conexao do WhatsApp\n"
-            "/desconectar - fechar conexao sem apagar sessao quando possivel\n"
-            "/nova - criar campanha com precaucao\n"
-            "/nova_confianca - campanha para contatos de confianca\n"
-            "/nova_precaucao - campanha mais cuidadosa\n"
-            "/listas - gerenciar listas de contatos\n"
-            "/disparar - iniciar campanha pronta\n"
-            "/status - ver ultimas campanhas\n"
-            "/cancelar - cancelar campanha ativa\n"
-            "/blacklist - bloquear telefone para nunca mais receber\n"
-            "/blacklist_remover - remover telefone da blacklist\n"
-            "/blacklist_listar - ver os telefones bloqueados\n"
-            "/blacklist_arquivo - importar varios telefones para a blacklist"
-        )
+        await send_main_menu(update.effective_message, "👋 Oi! Escolha o que fazer:")
         return
 
     pending = await db.get_pending_request(user_id)
@@ -210,45 +765,40 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     instance_name = f"vendor_{user.id}"
     await db.ensure_vendor(user.id, user.username or f"user_{user.id}", instance_name)
 
-    await update.message.reply_text("Preparando conexao do WhatsApp...")
+    await update.message.reply_text("Preparando a conexão do WhatsApp... ⏳")
     try:
         await power.ensure_running()
     except Exception as exc:
         logger.exception("Erro ao ligar Evolution")
-        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao ligar Evolution (/login)\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await update.message.reply_text(FRIENDLY_ERROR)
         return
 
     state = await evolution.connection_state(instance_name)
     if state == "open":
         await ensure_instance_webhook(settings, evolution, instance_name)
-        await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
+        await update.message.reply_text("✅ Seu WhatsApp já está conectado!")
         schedule_idle_stop(context)
         return
 
-    try:
-        qr_base64 = await evolution.ensure_fresh_qr(instance_name)
-    except Exception as exc:
-        logger.exception("Erro ao gerar QR")
-        await update.message.reply_text(f"Erro ao gerar QR: {exc}")
-        return
-
-    image = qr_photo_bytes(qr_base64)
-    if not image:
-        state = await evolution.connection_state(instance_name)
-        if state == "open":
-            await ensure_instance_webhook(settings, evolution, instance_name)
-            await update.message.reply_text("WhatsApp ja esta conectado para esta vendedora.")
-        else:
-            await update.message.reply_text(
-                f"Evolution respondeu sem QR e a conexao esta em '{state}'. Tente /login novamente em alguns segundos."
-            )
-        schedule_idle_stop(context)
-        return
-
-    await update.message.reply_photo(
-        photo=io.BytesIO(image),
-        caption="Escaneie em WhatsApp > Aparelhos conectados > Conectar aparelho.",
-    )
+    phone = await db.get_vendor_phone(user.id)
+    if phone:
+        await update.message.reply_text(
+            f"Vamos conectar o WhatsApp do número {phone}. 📱\n\n"
+            "🔢 Com código — você digita um número no WhatsApp. O mais fácil!\n"
+            "📷 Com QR Code — aponta a câmera.",
+            reply_markup=connect_choice_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "Para conectar, preciso do seu número uma única vez. 😊",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Conectar WhatsApp", callback_data="menu_connect")],
+            ]),
+        )
     schedule_idle_stop(context)
 
 
@@ -340,36 +890,22 @@ async def nova(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await power.ensure_running()
     except Exception as exc:
         logger.exception("Erro ao ligar Evolution")
-        await update.message.reply_text(f"Erro ao ligar Evolution: {exc}")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao ligar Evolution (/nova)\nUsuário: {user.full_name} ({user.id})\n{exc}",
+        )
+        await update.message.reply_text(FRIENDLY_ERROR)
         return ConversationHandler.END
 
     state = await evolution.connection_state(instance_name)
     if state != "open":
-        await update.message.reply_text("WhatsApp ainda nao esta conectado. Preparando QR...")
-        try:
-            qr_base64 = await evolution.ensure_fresh_qr(instance_name)
-        except Exception as exc:
-            logger.exception("Erro ao gerar QR")
-            await update.message.reply_text(f"Erro ao gerar QR: {exc}")
-            return ConversationHandler.END
-        image = qr_photo_bytes(qr_base64)
-        if image:
-            await update.message.reply_photo(
-                photo=io.BytesIO(image),
-                caption="Escaneie o QR e rode /nova novamente quando a conexao estiver aberta.",
-            )
-            schedule_idle_stop(context)
-            return ConversationHandler.END
-        state = await evolution.connection_state(instance_name)
-        if state == "open":
-            await ensure_instance_webhook(settings, evolution, instance_name)
-            profile_id = profile_from_command(update, settings.default_profile)
-            context.user_data["pending_campaign_profile_id"] = profile_id
-            await show_campaign_contact_source(update.message, db, user.id, profile_id)
-            schedule_idle_stop(context)
-            return WAITING_CONTACT_SOURCE
-        else:
-            await update.message.reply_text(f"Conexao ainda nao abriu. Estado atual: {state}. Rode /conexao para verificar.")
+        await update.message.reply_text(
+            "Seu WhatsApp ainda não está conectado. 😕\n"
+            "Conecte primeiro (leva 1 minutinho) e rode /nova de novo.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Conectar WhatsApp agora", callback_data="menu_connect")],
+            ]),
+        )
         schedule_idle_stop(context)
         return ConversationHandler.END
 
@@ -661,11 +1197,15 @@ async def create_temp_campaign(query, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["campaign_id"] = campaign_id
     campaign_dir(settings, campaign_id).mkdir(parents=True, exist_ok=True)
     await query.edit_message_text(
-        f"Campanha #{campaign_id} criada.\n"
-        f"Perfil: {profile.label}.\n"
+        f"Campanha #{campaign_id} criada. 🎉\n"
+        f"Ritmo: {profile.label}.\n"
         f"Envie CSV, VCF bruto, ou ZIP com CSV/VCF dentro.\n"
-        f"Limite: {contact_limit_label(contact_limit)}.\n"
-        "Se o Telegram transformar em cartoes de contato, use /pronto quando terminar."
+        f"Limite: {contact_limit_label(contact_limit)}.\n\n"
+        "Se o Telegram transformar em cartões de contato, tudo bem também.\n"
+        "Quando terminar, toque no botão abaixo.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Terminei os contatos", callback_data="ccontacts_done")],
+        ]),
     )
 
 
@@ -955,7 +1495,11 @@ async def receive_contacts_file(update: Update, context: ContextTypes.DEFAULT_TY
         extra = f"\nIgnorados por estarem na blacklist: {total['blacklisted']}."
     await update.message.reply_text(
         f"Contatos importados: {total['total']}.{extra}\n"
-        "Agora envie imagens, uma por vez, ou use /sem_midia. Quando terminar, use /pronto."
+        "Agora envie as fotos da campanha, uma por vez.\n\n"
+        "Sem fotos? Toque no botão abaixo para escrever só o texto.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Continuar sem fotos", callback_data="cmedia_done")],
+        ]),
     )
     return WAITING_MEDIA
 
@@ -1007,21 +1551,31 @@ async def receive_contact_card(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def contacts_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, db, _, _ = services(context)
+    message = update.effective_message
     campaign_id = context.user_data.get("campaign_id")
     if not campaign_id:
-        await update.message.reply_text("Campanha nao encontrada. Use /nova.")
+        await message.reply_text("Campanha nao encontrada. Use /nova.")
         return ConversationHandler.END
 
     campaign = await db.get_campaign(campaign_id)
     if not campaign or campaign["total_contacts"] <= 0:
-        await update.message.reply_text("Nenhum contato valido importado ainda.")
+        await message.reply_text("Nenhum contato valido importado ainda.")
         return WAITING_CSV
 
-    await update.message.reply_text(
-        f"Contatos confirmados: {campaign['total_contacts']}.\n"
-        "Agora envie imagens, uma por vez, ou use /sem_midia. Quando terminar, use /pronto."
+    await message.reply_text(
+        f"Contatos confirmados: {campaign['total_contacts']}. ✅\n"
+        "Agora envie as fotos, uma por vez.\n\n"
+        "Sem fotos? Toque no botão abaixo.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Continuar sem fotos", callback_data="cmedia_done")],
+        ]),
     )
     return WAITING_MEDIA
+
+
+async def contacts_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await contacts_done(update, context)
 
 
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1045,7 +1599,12 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = campaign_dir(settings, campaign_id) / file_name
     await file.download_to_drive(path)
     await db.add_media(campaign_id, str(path), "image/jpeg", file_name)
-    await update.message.reply_text(f"Imagem {count + 1} recebida. Envie outra ou use /pronto.")
+    await update.message.reply_text(
+        f"Imagem {count + 1} recebida. ✅ Envie outra ou toque no botão para continuar.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Continuar", callback_data="cmedia_done")],
+        ]),
+    )
     return WAITING_MEDIA
 
 
@@ -1070,7 +1629,12 @@ async def receive_image_document(update: Update, context: ContextTypes.DEFAULT_T
     file = await context.bot.get_file(document.file_id)
     await file.download_to_drive(path)
     await db.add_media(campaign_id, str(path), mime_from_name(file_name), file_name)
-    await update.message.reply_text(f"Imagem {count + 1} recebida. Envie outra ou use /pronto.")
+    await update.message.reply_text(
+        f"Imagem {count + 1} recebida. ✅ Envie outra ou toque no botão para continuar.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Continuar", callback_data="cmedia_done")],
+        ]),
+    )
     return WAITING_MEDIA
 
 
@@ -1081,8 +1645,24 @@ def media_size_allowed(file_size: int | None, max_mb: int) -> bool:
 
 
 async def media_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Envie agora a legenda, ou use /sem_texto para enviar somente a imagem.")
+    await update.effective_message.reply_text(
+        "Agora escreva a mensagem que vai junto das fotos. 💬\n\n"
+        "Só as fotos, sem texto? Toque no botão abaixo.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭ Enviar sem texto", callback_data="ccap_none")],
+        ]),
+    )
     return WAITING_CAPTION
+
+
+async def media_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await media_done(update, context)
+
+
+async def no_caption_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await receive_no_caption(update, context)
 
 
 async def receive_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1092,7 +1672,7 @@ async def receive_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await db.set_caption(campaign_id, update.message.text)
-    await reply_campaign_ready(update, db, campaign_id)
+    await reply_campaign_ready(update.effective_message, db, campaign_id)
     return ConversationHandler.END
 
 
@@ -1104,20 +1684,27 @@ async def receive_no_caption(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     media_count = await db.count_media(campaign_id)
     if media_count <= 0:
-        await update.message.reply_text("Sem imagem e sem texto nao ha o que enviar. Envie uma legenda.")
+        await update.effective_message.reply_text(
+            "Sem imagem e sem texto não há o que enviar. 🙈 Escreva uma mensagem:"
+        )
         return WAITING_CAPTION
 
     await db.set_caption(campaign_id, "")
-    await reply_campaign_ready(update, db, campaign_id)
+    await reply_campaign_ready(update.effective_message, db, campaign_id)
     return ConversationHandler.END
 
 
-async def reply_campaign_ready(update: Update, db: Database, campaign_id: int):
+async def reply_campaign_ready(message, db: Database, campaign_id: int):
     campaign = await db.get_campaign(campaign_id)
-    await update.message.reply_text(
-        f"Campanha #{campaign_id} pronta.\n"
-        f"Contatos: {campaign['total_contacts']}\n"
-        "Use /disparar para iniciar."
+    await message.reply_text(
+        f"Campanha #{campaign_id} pronta! 🎉\n"
+        f"Contatos: {campaign['total_contacts']}\n\n"
+        "Falta só a revisão final antes do disparo.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Revisar e disparar", callback_data=f"cdisp_go_{campaign_id}")],
+            [InlineKeyboardButton("🗑 Descartar campanha", callback_data=f"cdraft_discard_{campaign_id}")],
+            back_to_menu_row(),
+        ]),
     )
 
 
@@ -1147,35 +1734,31 @@ async def _build_preflight(db: Database, campaign_id: int, vendor_id: int) -> tu
         counts[cls] = counts.get(cls, 0) + 1
 
     lines = [
-        f"Campanha #{campaign_id} - pre-flight",
-        f"Pendentes: {len(phones)}",
+        f"Campanha #{campaign_id} — revisão rápida 🔍",
+        f"Vou enviar para {len(phones)} pessoas:",
         "",
-        f"  Quentes (responderam < 90d ou leram < 30d): {counts['hot']}",
-        f"  Mornos (entregaram, sem resposta recente):  {counts['warm']}",
-        f"  Frios (sem entrega ha muito tempo):         {counts['cold']}",
-        f"  Sem historico nesta base:                   {counts['unknown']}",
+        f"  ✅ Responderam recentemente: {counts['hot']}",
+        f"  🙂 Já receberam antes: {counts['warm']}",
+        f"  🆕 Nunca receberam: {counts['unknown']}",
+        f"  💤 Sumidos há muito tempo: {counts['cold']}",
     ]
     if not phones:
         lines.append("")
         lines.append("Nenhum contato pendente para disparar.")
     if counts["cold"]:
         lines.append("")
-        lines.append("Bloqueado: exclua os frios antes de disparar.")
+        lines.append(
+            f"Antes de disparar, vou remover {counts['cold']} contatos sumidos há muito tempo "
+            "(eles deixam seu número em risco de bloqueio)."
+        )
 
     keyboard_rows = []
-    if phones and not counts["cold"]:
-        keyboard_rows.append([InlineKeyboardButton("Disparar agora", callback_data=f"disparar_go:{campaign_id}")])
-    if counts["cold"]:
-        keyboard_rows.append(
-            [InlineKeyboardButton("Excluir frios", callback_data=f"disparar_drop_cold:{campaign_id}")]
-        )
     if phones:
+        keyboard_rows.append([InlineKeyboardButton("🚀 Preparar e disparar", callback_data=f"disparar_go:{campaign_id}")])
         keyboard_rows.append(
-            [InlineKeyboardButton("Verificar WhatsApp ativo", callback_data=f"disparar_check_wa:{campaign_id}")]
+            [InlineKeyboardButton("🔍 Checar números no WhatsApp", callback_data=f"disparar_check_wa:{campaign_id}")]
         )
-    keyboard_rows.append(
-        [InlineKeyboardButton("Cancelar disparo", callback_data=f"disparar_cancel:{campaign_id}")]
-    )
+    keyboard_rows.append([InlineKeyboardButton("✖️ Cancelar disparo", callback_data=f"disparar_cancel:{campaign_id}")])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
 
 
@@ -1207,22 +1790,28 @@ async def _start_dispatch(query, context: ContextTypes.DEFAULT_TYPE, campaign_id
         return
 
     phones = await db.pending_phones_for_campaign(campaign_id)
-    classification = await db.classify_phones(campaign["vendor_id"], phones)
-    cold_count = sum(1 for cls in classification.values() if cls == "cold")
-    if cold_count:
-        text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
-        await safe_edit_query_text(query, text, reply_markup=keyboard)
-        return
     if not phones:
         text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
         await safe_edit_query_text(query, text, reply_markup=keyboard)
         return
 
+    # Contatos "sumidos ha muito tempo" saem automaticamente: sao o maior risco
+    # de denuncia, e a vendedora nao precisa entender a classificacao.
+    classification = await db.classify_phones(campaign["vendor_id"], phones)
+    cold_phones = [p for p, cls in classification.items() if cls == "cold"]
+    dropped_cold = 0
+    if cold_phones:
+        dropped_cold = await db.fail_pending_phones(campaign_id, cold_phones, "preflight: frio")
+
     try:
         await power.ensure_running()
     except Exception as exc:
         logger.exception("Erro ao ligar Evolution")
-        await safe_edit_query_text(query, f"Erro ao ligar Evolution: {exc}")
+        await notify_admins(
+            context,
+            f"⚠️ Falha ao ligar Evolution (disparo)\nCampanha: #{campaign_id}\n{exc}",
+        )
+        await safe_edit_query_text(query, FRIENDLY_ERROR)
         return
 
     state = await evolution.connection_state(campaign["instance_name"])
@@ -1238,6 +1827,11 @@ async def _start_dispatch(query, context: ContextTypes.DEFAULT_TYPE, campaign_id
     ok = await scheduler.start(campaign_id, query.message.chat_id, progress_message.message_id)
     if not ok:
         await progress_message.edit_text("Campanha ja esta em execucao.")
+    elif dropped_cold:
+        await progress_message.edit_text(
+            f"Removidos {dropped_cold} contatos sumidos há muito tempo (proteção do seu número). "
+            "Iniciando a campanha..."
+        )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1272,9 +1866,83 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def dispatch_review_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Botao 'Revisar e disparar' do cartao de campanha pronta."""
+    query = update.callback_query
+    settings, db, _, _ = services(context)
+    try:
+        campaign_id = int((query.data or "").split("_")[-1])
+    except ValueError:
+        await query.answer("Ação inválida.", show_alert=True)
+        return
+
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign:
+        await query.answer("Campanha não encontrada.", show_alert=True)
+        return
+    if campaign["vendor_id"] != query.from_user.id and not is_authorized(settings, query.from_user.id):
+        await query.answer("Sem permissão.", show_alert=True)
+        return
+    if campaign["status"] != "ready":
+        await query.answer(f"Campanha está {campaign['status']}.", show_alert=True)
+        return
+
+    await query.answer()
+    text, keyboard = await _build_preflight(db, campaign_id, campaign["vendor_id"])
+    await query.message.reply_text(text, reply_markup=keyboard)
+
+
+async def draft_discard_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Botao 'Descartar' de campanha draft/pronta."""
+    query = update.callback_query
+    settings, db, _, scheduler = services(context)
+    try:
+        campaign_id = int((query.data or "").split("_")[-1])
+    except ValueError:
+        await query.answer("Ação inválida.", show_alert=True)
+        return
+
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign:
+        await query.answer("Campanha não encontrada.", show_alert=True)
+        return
+    if campaign["vendor_id"] != query.from_user.id and not is_authorized(settings, query.from_user.id):
+        await query.answer("Sem permissão.", show_alert=True)
+        return
+
+    await query.answer()
+    ok = await scheduler.cancel_campaign(campaign_id)
+    context.user_data.pop("campaign_id", None)
+    await safe_edit_query_text(
+        query,
+        f"Campanha #{campaign_id} descartada. 🗑" if ok else f"Campanha #{campaign_id} não estava ativa.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+
+    if data.startswith("menu_"):
+        await handle_menu_callback(update, context)
+        return
+
+    if data.startswith("cdisp_go_"):
+        await dispatch_review_action(update, context)
+        return
+
+    if data.startswith("cdraft_discard_"):
+        await draft_discard_action(update, context)
+        return
+
+    if data == "cconnect_pair":
+        await start_pairing_connect(query, context)
+        return
+
+    if data == "cconnect_qr":
+        await start_qr_connect(query, context)
+        return
 
     if data.startswith("campaign_"):
         await handle_campaign_callback(update, context)
@@ -1288,8 +1956,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_blacklist_callback(update, context)
         return
 
-    if data.startswith(("src_", "list_", "menu_")):
-        await query.answer("Esse menu expirou. Use /nova ou /listas novamente.", show_alert=True)
+    if data.startswith(("src_", "list_")):
+        await query.answer("Esse menu expirou. Use /menu para recomeçar.", show_alert=True)
         return
 
     if data == "perm_yes":
@@ -1305,9 +1973,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("approve_"):
+        settings, db, _, _ = services(context)
+        if not is_authorized(settings, query.from_user.id):
+            await query.answer("Apenas administradores podem aprovar acesso.", show_alert=True)
+            return
         await query.answer()
         target_id = int(data.split("_", 1)[1])
-        settings, db, _, _ = services(context)
         request = await db.get_pending_request(target_id)
         if not request:
             await query.edit_message_text("Solicitação não encontrada ou já processada.")
@@ -1324,9 +1995,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("reject_"):
+        settings, db, _, _ = services(context)
+        if not is_authorized(settings, query.from_user.id):
+            await query.answer("Apenas administradores podem recusar acesso.", show_alert=True)
+            return
         await query.answer()
         target_id = int(data.split("_", 1)[1])
-        settings, db, _, _ = services(context)
         request = await db.get_pending_request(target_id)
         if not request:
             await query.edit_message_text("Solicitação não encontrada ou já processada.")
@@ -1554,6 +2228,12 @@ async def handle_blacklist_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     data = query.data or ""
     settings, db, _, _ = services(context)
+
+    if data == "bl_menu_list":
+        await query.answer()
+        text, keyboard = await _render_blacklist_page(db, offset=0)
+        await query.message.reply_text(text, reply_markup=keyboard)
+        return
 
     if data.startswith("bl_page:"):
         try:
@@ -1844,10 +2524,19 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if context.error:
         exc_info = (type(context.error), context.error, context.error.__traceback__)
     logger.error("Erro inesperado no handler do Telegram", exc_info=exc_info)
+
+    user = getattr(update, "effective_user", None)
+    who = f"{user.full_name} ({user.id})" if user else "usuário desconhecido"
+    error_text = f"{type(context.error).__name__}: {context.error}" if context.error else "sem detalhe"
+    try:
+        await notify_admins(context, f"⚠️ Erro no bot\nUsuário: {who}\n{error_text}")
+    except Exception:
+        pass
+
     message = getattr(update, "effective_message", None)
     if message:
         try:
-            await message.reply_text("Erro interno no bot. Tente o comando novamente.")
+            await message.reply_text(FRIENDLY_ERROR)
         except Exception:
             pass
 

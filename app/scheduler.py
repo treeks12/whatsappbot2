@@ -226,6 +226,16 @@ class CampaignScheduler:
                         )
                         return
 
+                    # Re-check de blacklist: o numero pode ter sido bloqueado depois
+                    # que a campanha foi montada (corrida com o purge das filas).
+                    if await self.db.is_phone_blacklisted(contact["phone"]):
+                        await self.db.mark_contact_failed(campaign_id, contact["id"], "blacklist")
+                        logger.info(
+                            "Contato %s pulado: telefone entrou na blacklist durante o disparo.",
+                            contact["id"],
+                        )
+                        continue
+
                     before = await self.db.campaign_progress(campaign_id)
                     total = before["total"] or campaign["total_contacts"]
                     current_number = before["processed"] + 1

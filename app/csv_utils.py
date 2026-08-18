@@ -61,6 +61,26 @@ def parse_contacts_vcf(path: Path, max_contacts: int) -> list[dict]:
     return contacts
 
 
+def _read_zip_member_text(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> tuple[str, int]:
+    """Le o membro limitando os bytes realmente decomprimidos.
+
+    O file_size do cabecalho do ZIP pode mentir (zip bomba), entao o limite
+    precisa ser aplicado sobre os bytes lidos de verdade, nao sobre o declarado.
+    """
+    chunks = []
+    total = 0
+    with archive.open(member) as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_ZIP_MEMBER_BYTES:
+                raise ValueError("ZIP contem arquivo CSV/VCF grande demais apos descompactar.")
+            chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8-sig", errors="replace"), total
+
+
 def parse_contacts_zip(path: Path, max_contacts: int) -> list[dict]:
     contacts = []
     seen = set()
@@ -77,15 +97,15 @@ def parse_contacts_zip(path: Path, max_contacts: int) -> list[dict]:
                 continue
 
             accepted_files += 1
-            total_uncompressed += member.file_size
             if accepted_files > MAX_ZIP_FILES:
                 raise ValueError(f"ZIP tem arquivos demais; limite atual e {MAX_ZIP_FILES} CSV/VCF.")
             if member.file_size > MAX_ZIP_MEMBER_BYTES:
                 raise ValueError("ZIP contem arquivo CSV/VCF grande demais.")
+
+            content, actual_size = _read_zip_member_text(archive, member)
+            total_uncompressed += actual_size
             if total_uncompressed > MAX_ZIP_TOTAL_BYTES:
                 raise ValueError("ZIP grande demais apos descompactar.")
-
-            content = archive.read(member).decode("utf-8-sig", errors="replace")
             parsed = parse_contacts_csv_text(content) if suffix == ".csv" else parse_contacts_vcf_text(content)
 
             for item in parsed:

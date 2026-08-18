@@ -33,6 +33,7 @@ def _admin_ids() -> Set[int]:
 class Settings:
     telegram_bot_token: str
     telegram_admin_ids: Set[int]
+    allow_open_access: bool
     evolution_api_url: str
     evolution_api_key: str
     database_path: Path
@@ -77,6 +78,7 @@ def load_settings() -> Settings:
     return Settings(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_admin_ids=_admin_ids(),
+        allow_open_access=_bool_env("ALLOW_OPEN_ACCESS", False),
         evolution_api_url=os.getenv("EVOLUTION_API_URL", "http://evolution-api:8080").rstrip("/"),
         evolution_api_key=evolution_api_key,
         database_path=Path(os.getenv("DATABASE_PATH", "/app/data/bot.sqlite3")),

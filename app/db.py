@@ -195,6 +195,22 @@ class Database:
                     (telegram_id, username, instance_name),
                 )
 
+    async def set_vendor_phone(self, telegram_id: int, phone_e164: str):
+        async with self._lock:
+            with self.connect() as conn:
+                conn.execute(
+                    "UPDATE vendors SET phone_e164 = ? WHERE telegram_id = ?",
+                    (phone_e164, telegram_id),
+                )
+
+    async def get_vendor_phone(self, telegram_id: int) -> Optional[str]:
+        async with self._lock:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT phone_e164 FROM vendors WHERE telegram_id = ?", (telegram_id,)
+                ).fetchone()
+                return row["phone_e164"] if row else None
+
     async def get_vendor(self, telegram_id: int) -> Optional[sqlite3.Row]:
         async with self._lock:
             with self.connect() as conn:
@@ -1308,6 +1324,12 @@ class Database:
         }
         if "dispatch_order" not in contact_columns:
             conn.execute("ALTER TABLE contacts ADD COLUMN dispatch_order INTEGER")
+        vendor_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(vendors)").fetchall()
+        }
+        if "phone_e164" not in vendor_columns:
+            conn.execute("ALTER TABLE vendors ADD COLUMN phone_e164 TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_contacts_campaign_dispatch
