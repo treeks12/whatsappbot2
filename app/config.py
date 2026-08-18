@@ -48,6 +48,7 @@ class Settings:
     cleanup_campaign_files_on_finish: bool
     default_profile: str
     send_window: Optional[str]
+    send_window_tz: str
     min_free_memory_mb: int
     evolution_docker_control: bool
     evolution_docker_container: str
@@ -93,6 +94,9 @@ def load_settings() -> Settings:
         cleanup_campaign_files_on_finish=_bool_env("CLEANUP_CAMPAIGN_FILES_ON_FINISH", True),
         default_profile=os.getenv("DEFAULT_PROFILE", "humano_100"),
         send_window=os.getenv("SEND_WINDOW") or None,
+        # Vazio = janela interpretada na hora local do container (UTC na imagem
+        # oficial). Em producao (VPS no Brasil) use America/Sao_Paulo.
+        send_window_tz=os.getenv("SEND_WINDOW_TZ", "").strip(),
         min_free_memory_mb=_int_env("MIN_FREE_MEMORY_MB", 256),
         evolution_docker_control=_bool_env("EVOLUTION_DOCKER_CONTROL", False),
         evolution_docker_container=os.getenv("EVOLUTION_DOCKER_CONTAINER", "evolution-api"),

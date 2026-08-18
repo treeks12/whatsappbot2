@@ -8,6 +8,7 @@ import struct
 import uuid
 import zlib
 from datetime import datetime, time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Dict, Optional, Any
 
@@ -106,11 +107,15 @@ class CampaignScheduler:
         min_free_memory_mb: int = 256,
         evolution_power: Optional[Any] = None,
         suspicion_tracker: Optional[SuspicionTracker] = None,
+        send_window_tz: str = "",
     ):
         self.db = db
         self.evolution = evolution
         self.telegram_app = telegram_app
         self.send_window = parse_window(send_window)
+        # Fuso que interpreta a janela. Sem ele o container em UTC bloqueia a
+        # campanha fora dela (ex.: 16h de Brasilia = 19h UTC > fim da janela).
+        self.send_window_tz = _parse_zone(send_window_tz)
         self.progress_update_interval_seconds = max(2, progress_update_interval_seconds)
         self.campaigns_dir = campaigns_dir
         self.cleanup_campaign_files_on_finish = cleanup_campaign_files_on_finish
@@ -384,7 +389,7 @@ class CampaignScheduler:
         if not self.send_window:
             return
 
-        while not is_inside_window(self.send_window):
+        while not is_inside_window(self.send_window, self.send_window_tz):
             await asyncio.sleep(60)
 
     async def _wait_if_paused(self, campaign_id: int, progress):
@@ -486,12 +491,23 @@ def parse_time(raw: str) -> time:
     return time(int(hour), int(minute))
 
 
-def is_inside_window(window) -> bool:
+def is_inside_window(window, tz=None) -> bool:
     start, end = window
-    now = datetime.now().time()
+    now = datetime.now(tz).time()
     if start <= end:
         return start <= now <= end
     return now >= start or now <= end
+
+
+def _parse_zone(raw: str):
+    """Resolve o fuso da janela de envio; None = hora local do container."""
+    if not raw:
+        return None
+    try:
+        return ZoneInfo(raw)
+    except ZoneInfoNotFoundError:
+        logger.warning("SEND_WINDOW_TZ '%s' invalido; janela usara a hora do container.", raw)
+        return None
 
 
 def render_caption(template: str, contact_name: str) -> str:

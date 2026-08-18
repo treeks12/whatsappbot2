@@ -79,9 +79,26 @@ async def post_init(application: Application):
         except Exception:
             logger.info("Webhook no boot adiado: Evolution ainda nao respondeu.")
     await power.stop_if_idle(db)
+    # Campanhas 'running' cujo task morreu no restart: religa o disparo.
+    await _resume_running_campaigns(db, scheduler)
     heartbeat_task = asyncio.create_task(_heartbeat_loop(application))
     application.bot_data["heartbeat_task"] = heartbeat_task
     logger.info("Bot v2 inicializado")
+
+
+async def _resume_running_campaigns(db: Database, scheduler: CampaignScheduler):
+    """Reinicia campanhas que ficaram 'running' sem task apos restart do bot."""
+    try:
+        campaign_ids = await db.list_campaign_ids_by_status("running")
+    except Exception:
+        logger.exception("Falha ao listar campanhas running para retomar no boot")
+        return
+    for campaign_id in campaign_ids:
+        try:
+            if await scheduler.start(campaign_id):
+                logger.info("Campanha %s retomada apos restart do bot", campaign_id)
+        except Exception:
+            logger.exception("Falha ao retomar a campanha %s no boot", campaign_id)
 
 
 async def _reconfigure_vendor_instances(db: Database, evolution: EvolutionClient, public_url: str):
@@ -206,6 +223,7 @@ def main():
         settings.min_free_memory_mb,
         power,
         suspicion_tracker=suspicion_tracker,
+        send_window_tz=settings.send_window_tz,
     )
 
     application.bot_data["settings"] = settings

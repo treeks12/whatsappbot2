@@ -224,6 +224,15 @@ class Database:
                 ).fetchall()
                 return [row["instance_name"] for row in rows]
 
+    async def list_campaign_ids_by_status(self, status: str) -> list[int]:
+        """Campanhas em 'running' viram orfas a cada restart do bot; boot as retoma."""
+        async with self._lock:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM campaigns WHERE status = ?", (status,)
+                ).fetchall()
+                return [int(row["id"]) for row in rows]
+
     async def create_campaign(self, vendor_id: int, profile_id: str) -> int:
         async with self._lock:
             with self.connect() as conn:

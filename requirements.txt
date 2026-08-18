@@ -2,3 +2,5 @@ python-telegram-bot==22.7
 aiohttp==3.13.5
 aiofiles==25.1.0
 python-dotenv==1.2.2
+# ZoneInfo precisa de dados de fuso (SEND_WINDOW_TZ); alpine nao os embute.
+tzdata==2025.2
