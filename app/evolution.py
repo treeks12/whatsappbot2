@@ -134,6 +134,10 @@ class EvolutionClient:
 
         A vendedora digita o codigo no celular em WhatsApp > Aparelhos conectados >
         Conectar com numero de telefone. Retorna "" se a sessao ja estiver aberta.
+
+        Nesta versao da Evolution (2.4.0-rc2) o pairing vem de
+        GET /instance/connect/<instancia>?number=<telefone>&qrcode=false,
+        e a chave da resposta e "pairingCode" (confirmado por probe na propria API).
         """
         if await self.connection_state(instance_name) == "open":
             return ""
@@ -145,12 +149,10 @@ class EvolutionClient:
                 raise
 
         payload = await self._request(
-            "POST",
-            f"/instance/connect/{instance_name}",
-            json={"number": phone_e164, "qrcode": False},
+            "GET",
+            f"/instance/connect/{instance_name}?number={phone_e164}&qrcode=false",
         )
-        pairing = payload.get("pairing") if isinstance(payload, dict) else None
-        code = str((pairing or {}).get("code") or "").strip() if isinstance(pairing, dict) else ""
+        code = str(payload.get("pairingCode") or "").strip()
         if not code:
             raise EvolutionError(f"Pairing code nao retornado para {instance_name}: {payload}")
         return code
