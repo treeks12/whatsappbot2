@@ -124,7 +124,25 @@ class EvolutionClient:
         return await self._request("POST", "/instance/create", json=payload)
 
     async def delete_instance(self, instance_name: str) -> Dict[str, Any]:
-        return await self._request("DELETE", f"/instance/delete/{instance_name}")
+        try:
+            return await self._request("DELETE", f"/instance/delete/{instance_name}")
+        except EvolutionError as exc:
+            # 404 "does not exist": objetivo alcancado (ja foi apagada).
+            if "does not exist" in str(exc):
+                return {}
+            raise
+
+    async def instance_exists(self, instance_name: str) -> bool:
+        """A delecao na Evolution e assincrona: aqui vemos se ela JA sumiu."""
+        try:
+            data = await self._request("GET", "/instance/fetchInstances")
+        except EvolutionError:
+            return True  # sem resposta, assume pior caso (nao recriar em cima)
+        for item in data if isinstance(data, list) else []:
+            inst = item.get("instance") or {}
+            if inst.get("instanceName") == instance_name or item.get("name") == instance_name:
+                return True
+        return False
 
     async def connect_instance(self, instance_name: str) -> Dict[str, Any]:
         return await self._request("GET", f"/instance/connect/{instance_name}")

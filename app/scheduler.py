@@ -467,12 +467,36 @@ class CampaignScheduler:
             await self.evolution_power.ensure_running()
 
     async def _ensure_connection_open(self, instance_name: str):
-        if await self._connection_closed(instance_name):
-            raise CampaignConnectionLost("WhatsApp nao esta conectado.")
+        """Garante sessao aberta COM PACIENCIA.
+
+        Um flap transitorio (515/428, segundos) nao pode derrubar a campanha
+        inteira — leitura unica matava campanha no primeiro soluço. Declara
+        perdida so depois de varias leituras fora do 'open', uma tentativa de
+        religar (estado 'close' = socket morto, religar e seguro) e nova espera.
+        """
+        reads = 0
+        while reads < 5:
+            state = await self.evolution.connection_state(instance_name)
+            if state == "open":
+                return
+            reads += 1
+            # 'connecting' = socket vivo tentando voltar: so esperar.
+            # 'close' = sem socket: religa (nunca cria segundo socket).
+            if state == "close" and reads == 2:
+                try:
+                    await self.evolution.connect_instance(instance_name)
+                except EvolutionError:
+                    logger.warning("Tentativa de religar %s falhou", instance_name, exc_info=True)
+            await asyncio.sleep(6)
+        raise CampaignConnectionLost("WhatsApp nao esta conectado.")
 
     async def _connection_closed(self, instance_name: str) -> bool:
-        state = await self.evolution.connection_state(instance_name)
-        return state != "open"
+        """Re-check com paciencia: um erro de envio numa leitura unica nao encerra campanha."""
+        for _ in range(3):
+            if await self.evolution.connection_state(instance_name) == "open":
+                return False
+            await asyncio.sleep(5)
+        return True
 
     async def _stop_evolution_if_idle(self):
         if self.evolution_power:

@@ -534,9 +534,22 @@ async def start_pairing_connect(query, context: ContextTypes.DEFAULT_TYPE):
         # ha nada a preservar — apagar e recriar limpo e seguro.
         try:
             await evolution.delete_instance(instance_name)
-            await asyncio.sleep(3)
         except Exception:
             logger.warning("Falha ao limpar instancia antes do pairing", exc_info=True)
+        else:
+            # A delecao e assincrona na Evolution: recriar antes do socket antigo
+            # morrer cria DOIS sockets pela mesma sessao — a guerra de 440 que
+            # derrubou as campanhas 21/22 em 19/08. Espera sumir de verdade.
+            gone = False
+            for _ in range(6):
+                if not await evolution.instance_exists(instance_name):
+                    gone = True
+                    break
+                await asyncio.sleep(2.5)
+            if not gone:
+                logger.warning(
+                    "Instancia %s ainda listada apos delete; seguindo mesmo assim", instance_name
+                )
         code = await evolution.request_pairing_code(instance_name, phone)
         logger.info(
             "Pairing iniciado para %s (instancia recriada limpa, telefone %s)",
